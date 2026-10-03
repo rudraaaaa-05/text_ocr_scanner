@@ -1,7 +1,6 @@
 # OCR Scanner
 
 Read text from your screen with free (and paid) AI APIs and append it to a plain text file, one line per line of text.
-Built as a project for fun.
 
 ## Features
 
