@@ -27,8 +27,8 @@ Requires Python 3.9+.
 # Arch / Hyprland
 sudo pacman -S grim slurp
 
-git clone https://github.com/<you>/ocr-scanner
-cd ocr-scanner
+git clone https://github.com/rudraaaaa-05/text_ocr_scanner
+cd text_ocr_scanner
 ./run.sh          # Windows: run.bat
 ```
 
@@ -45,7 +45,8 @@ Several keys in one provider (comma separated) are used in turn, which stretches
 
 ## Hotkeys
 
-On X11, Windows and macOS the hotkeys work inside the app. Wayland apps cannot grab global keys, so on Hyprland you bind them in your compositor. The **Settings** tab generates the exact lines for your configured keys. Example (Hyprland Lua):
+On X11, Windows and macOS the hotkeys work inside the app. Wayland apps cannot grab global keys, so on Hyprland you bind them in your compositor.
+Example (Hyprland Lua):
 
 ```lua
 hl.bind("CTRL + ALT + O", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger region"))
