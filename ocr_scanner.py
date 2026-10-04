@@ -779,9 +779,7 @@ class OverlayManager(QObject):
         QTimer.singleShot(0, close_all)
 
 
-# ----------------------------------------------------------------------------
-# OCR via AI APIs
-# ----------------------------------------------------------------------------
+# ocr via AI api
 class OCRError(Exception):
     def __init__(self, msg: str, skip_provider: bool = False):
         super().__init__(msg)
@@ -1041,7 +1039,7 @@ class OCRClient:
                         break
                     continue
                 with self._lock:
-                    self._idx[pid] = i + 1  # rotate keys to spread free-tier limits
+                    self._idx[pid] = i + 1  # rotate keys to spread free tier limits
                 return clean_text(text), pdef["name"]
         raise OCRError(" | ".join(errors)[:600])
 
@@ -1097,9 +1095,7 @@ def frame_changed(a, b, threshold: float = 0.00005) -> bool:
     return ImageStat.Stat(diff).mean[0] / 255.0 > threshold
 
 
-# ----------------------------------------------------------------------------
-# Hotkeys (X11 / Windows / macOS via pynput)
-# ----------------------------------------------------------------------------
+#i don't even know if these work
 class HotkeyManager:
     def __init__(self, emit):
         self.emit = emit
@@ -1142,9 +1138,7 @@ class HotkeyManager:
         return True, "Global hotkeys active." + note
 
 
-# ----------------------------------------------------------------------------
-# Qt plumbing
-# ----------------------------------------------------------------------------
+
 class Bus(QObject):
     log = Signal(str, str)                # level, message
     result = Signal(str, int, str, str)   # text, lines saved, provider, source
@@ -1219,9 +1213,8 @@ class Recorder(threading.Thread):
             self.stop_evt.wait(wait)
 
 
-# ----------------------------------------------------------------------------
-# Styling
-# ----------------------------------------------------------------------------
+#css shit
+
 QSS = """
 QWidget { background: transparent; color: #e6e6e8; font-size: 13px; }
 QMainWindow, QWidget#root { background: #0e0e0f; }
@@ -1495,9 +1488,8 @@ class ProviderCard(QFrame):
         self.status.setVisible(bool(text))
 
 
-# ----------------------------------------------------------------------------
-# Main window
-# ----------------------------------------------------------------------------
+# main window
+
 class MainWindow(QMainWindow):
     def __init__(self, cfg: Config, bus: Bus, capturer: Capturer, ocr: OCRClient, sink: TextSink, ipc_ok: bool):
         super().__init__()
@@ -1544,7 +1536,7 @@ class MainWindow(QMainWindow):
         self.apply_hotkeys()
         self._startup_notes()
 
-    # ---- small helpers ----------------------------------------------------
+    
     def save_soon(self):
         self._save_timer.start()
 
@@ -1585,7 +1577,7 @@ class MainWindow(QMainWindow):
         if not self.ipc_ok:
             self.add_log("warn", "Could not open the command channel; --trigger hotkeys will not work.")
 
-    # ---- UI construction ----------------------------------------------------
+    # UI 
     def _build_ui(self):
         root = QWidget()
         root.setObjectName("root")
@@ -1641,7 +1633,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(16)
         return w, lay
 
-    # -- capture page
+    #  capture page
     def _build_capture_page(self):
         page, lay = self._page()
         h, s = page_header("Capture", "Read the whole screen, or just a region. New text is appended to your output file.")
@@ -1729,7 +1721,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(card3, 1)
         return scroll_wrap(page)
 
-    # -- AI keys page
+    # AI keys page
     def _build_keys_page(self):
         page, lay = self._page()
         h, s = page_header("AI Keys", "Pick the provider that reads your screen. Free tiers are enough for personal use.")
@@ -1755,7 +1747,7 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
         return scroll_wrap(page)
 
-    # -- settings page
+    # settings page
     def _bind_check(self, chk: QCheckBox, key: str):
         chk.setChecked(bool(self.d[key]))
         chk.toggled.connect(lambda v, k=key: self.set_cfg(k, bool(v)))
@@ -1908,7 +1900,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "chk_tray"):
             self.chk_tray.setEnabled(True)
 
-    # ---- settings handlers ------------------------------------------------------
+    
     def _output_edited(self):
         self.set_cfg("output_file", self.out_edit.text().strip() or default_config()["output_file"])
         self.out_edit.setText(self.d["output_file"])
@@ -1969,7 +1961,7 @@ class MainWindow(QMainWindow):
             return
         self.snippet.setPlainText(hypr_snippet(self.d["hotkeys"], self.syntax_combo.currentData()))
 
-    # ---- provider card callbacks ------------------------------------------------
+    
     def on_provider_edit(self, card: ProviderCard):
         self.d["providers"][card.pdef["id"]] = {**self.d["providers"][card.pdef["id"]], **card.snapshot()}
         self.save_soon()
@@ -2021,7 +2013,7 @@ class MainWindow(QMainWindow):
         else:
             card.set_status(f"The API answered but did not read the sample correctly: {text[:120]}", "warn")
 
-    # ---- mode / monitor -----------------------------------------------------------
+    # monitormode
     def _set_mode(self, mode: str):
         self.set_cfg("mode", mode)
         self._apply_mode_ui()
@@ -2054,7 +2046,7 @@ class MainWindow(QMainWindow):
         if key is not None:
             self.set_cfg("monitor", key)
 
-    # ---- state ----------------------------------------------------------------------
+    
     def _set_state(self, state: str):
         self.state = state
         idle = state == "idle"
@@ -2072,7 +2064,7 @@ class MainWindow(QMainWindow):
         self.side_status.setStyleSheet(f"color: {color};")
         self.stats_label.setText(f"{self.captures} scans \u00b7 {self.lines_total} lines saved this run")
 
-    # ---- recording control ----------------------------------------------------------
+    # recording recording
     def _ready(self, need_region: bool) -> bool:
         prob = self.capturer.problem(need_region=need_region)
         if prob:
@@ -2138,7 +2130,7 @@ class MainWindow(QMainWindow):
             self._set_state("idle")
             self.notify(APP_NAME, "Recording stopped after repeated errors.")
 
-    # ---- region selection -----------------------------------------------------------
+    # region selection
     def pick_region_clicked(self):
         prob = self.capturer.problem(need_region=True)
         if prob:
@@ -2209,7 +2201,7 @@ class MainWindow(QMainWindow):
         if cb:
             cb(None if err else region, None if err else img)
 
-    # ---- one-shot scan -----------------------------------------------------------------
+   # scan region  and read
     def one_shot(self):
         if self._oneshot_busy or self._selecting:
             return
@@ -2235,7 +2227,7 @@ class MainWindow(QMainWindow):
         finally:
             self._oneshot_busy = False
 
-    # ---- shared pipeline -----------------------------------------------------------------
+    # pipeline
     def process_image(self, img, force: bool = False):
         data, mime = encode_image(img, self.d["max_side"])
         text, provider = self.ocr.recognize(data, mime)
@@ -2257,7 +2249,7 @@ class MainWindow(QMainWindow):
         if source == "scan":
             self.notify("Scanned" if text.strip() else "No text found", text.strip()[:200] or "Nothing readable in that region.")
 
-    # ---- commands (hotkeys, tray, --trigger) -------------------------------------------------
+    
     def on_command(self, cmd: str):
         if cmd == "show":
             self.showNormal()
@@ -2280,7 +2272,7 @@ class MainWindow(QMainWindow):
         elif cmd == "pause":
             self.toggle_pause()
 
-    # ---- lifecycle -------------------------------------------------------------------------------
+    
     def quit_app(self):
         self._really_quit = True
         self.close()
@@ -2302,9 +2294,7 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
 
-# ----------------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------------
+
 def main() -> int:
     if send_command("show") is not None:
         print(f"{APP_NAME} is already running; brought its window forward.")
