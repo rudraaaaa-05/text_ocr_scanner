@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import html
+import importlib.util
 import io
 import json
 import os
@@ -19,7 +20,7 @@ from pathlib import Path
 
 APP_NAME = "OCR Scanner"
 APP_ID = "ocr-scanner"
-VERSION = "1.0"
+VERSION = "1.1"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
@@ -203,6 +204,11 @@ except ImportError as _exc:  # pragma: no cover
 
 
 PROVIDERS = [
+    dict(id="local", name="Local OCR (offline)", kind="local", free="Local", needs_key=False,
+         base_url="", edit_base=False, key_url="", key_label="",
+         model="small", fallback=True,
+         note="Runs on this computer: no key, no upload, no quota. A classic text detector plus recogniser, "
+              "so it reads what is printed and drops what it is unsure of instead of making text up."),
     dict(id="gemini", name="Google AI Studio (Gemini)", kind="gemini", free="Free tier", needs_key=True,
          base_url="https://generativelanguage.googleapis.com/v1beta", edit_base=False,
          key_url="https://aistudio.google.com/apikey", key_label="Get free key",
@@ -270,8 +276,10 @@ def default_config() -> dict:
         "language": "Auto-detect",
         "extra_prompt": "",
         "hotkeys": dict(HOTKEY_DEFAULTS),
-        "active_provider": "gemini",
+        "active_provider": "local",
         "fallback": True,
+        "local_min_conf": 70,
+        "local_max_side": 1280,
         "providers": {
             p["id"]: {"keys": "", "model": p["model"], "base_url": p["base_url"], "fallback": p["fallback"]}
             for p in PROVIDERS
@@ -349,6 +357,7 @@ PYNPUT_KEYS = {
 }
 
 #i tried to make it work on hyprland but it didn't work so i just kinda gave up
+
 HYPR_KEYS = {
     "Space": "space", "Return": "Return", "Enter": "KP_Enter", "Esc": "Escape", "Tab": "Tab",
     "Backspace": "BackSpace", "Del": "Delete", "Ins": "Insert", "PgUp": "Prior", "PgDown": "Next",
@@ -779,7 +788,8 @@ class OverlayManager(QObject):
         QTimer.singleShot(0, close_all)
 
 
-# ocr via AI api
+# OCR VIA AI API PROVIDERS
+
 class OCRError(Exception):
     def __init__(self, msg: str, skip_provider: bool = False):
         super().__init__(msg)
@@ -981,12 +991,186 @@ def fetch_models(pdef: dict, pc: dict, key: str) -> list:
 
 
 def run_test(pdef: dict, pc: dict, key: str, cfg: dict) -> str:
-    img = Image.new("RGB", (110, 28), "white")
-    ImageDraw.Draw(img).text((8, 8), "OCR TEST 123", fill="black")
-    img = img.resize((550, 140), Image.Resampling.NEAREST)
+    img = make_test_image()
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return clean_text(call_provider(pdef, pc, key, buf.getvalue(), "image/png", build_prompt(cfg)))
+
+# added local OCR
+
+LOCAL_INSTALL_HINT = "pip install rapidocr onnxruntime"
+# languages that are supported by the rapidocr wheel, and don't require any extra downloads
+LOCAL_LANG_WORDS = (
+    "japanese", "english", "chinese", "german", "french", "spanish", "portuguese", "italian",
+    "vietnamese", "dutch", "polish", "turkish", "swedish", "danish", "norwegian", "finnish",
+    "czech", "indonesian", "romanian", "hungarian",
+)
+
+
+def make_test_image():
+    img = Image.new("RGB", (110, 28), "white")
+    ImageDraw.Draw(img).text((8, 8), "OCR TEST 123", fill="black")
+    return img.resize((550, 140), Image.Resampling.NEAREST)
+
+
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return 0x3000 <= o <= 0x30FF or 0x3400 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF or 0xFF00 <= o <= 0xFFEF
+
+
+def assemble_lines(boxes, txts, scores, min_conf: float) -> str:
+    """Turn detector boxes into lines in reading order.
+
+    Boxes under min_conf are discarded outright. That is the anti-hallucination rule: a low-confidence
+    guess is worse than a gap, so it is never written.
+    """
+    if boxes is None or txts is None or scores is None:
+        return ""
+    items = []
+    for box, txt, sc in zip(boxes, txts, scores):
+        txt = (txt or "").strip()
+        if not txt or float(sc) < min_conf:
+            continue
+        xs = [float(pt[0]) for pt in box]
+        ys = [float(pt[1]) for pt in box]
+        items.append({"x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys), "t": txt})
+    if not items:
+        return ""
+    items.sort(key=lambda b: (b["y0"] + b["y1"]) / 2)
+    rows = []
+    for it in items:
+        cy, h = (it["y0"] + it["y1"]) / 2, max(1.0, it["y1"] - it["y0"])
+        for row in rows:
+            if abs(cy - row["cy"]) <= 0.5 * min(h, row["h"]):  # same visual line
+                row["items"].append(it)
+                n = len(row["items"])
+                row["cy"] += (cy - row["cy"]) / n
+                row["h"] += (h - row["h"]) / n
+                break
+        else:
+            rows.append({"cy": cy, "h": h, "items": [it]})
+    lines = []
+    for row in sorted(rows, key=lambda r: r["cy"]):
+        parts = sorted(row["items"], key=lambda b: b["x0"])
+        line = parts[0]["t"]
+        for prev, nxt in zip(parts, parts[1:]):
+            gap = nxt["x0"] - prev["x1"]
+            glue = _is_cjk(prev["t"][-1]) and _is_cjk(nxt["t"][0]) and gap < 0.6 * row["h"]
+            line += ("" if glue else " ") + nxt["t"]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+class LocalOCR:
+    """Offline OCR. Detects text lines, reads each one and scores it; low scores are dropped.
+
+    Tuned on measurements, not guesses:
+      * detector limit_type="max": the default upscales small crops to 736 px, which was ~25x slower on
+        region captures with no accuracy gain. We cap the size ourselves instead.
+      * angle classifier off: screen text is upright, and it only adds a chance of flipping short strings.
+      * model "small" ships inside the rapidocr wheel, so the default needs no download.
+    """
+    VARIANTS = ("small", "medium")
+
+    def __init__(self):
+        self._engines = {}
+        self._build_lock = threading.Lock()
+        self._run_lock = threading.Lock()
+
+    @staticmethod
+    def problem():
+        """None when usable, otherwise a human-readable reason."""
+        if importlib.util.find_spec("rapidocr") is None or importlib.util.find_spec("onnxruntime") is None:
+            return f"Local OCR is not installed. Run:  {LOCAL_INSTALL_HINT}"
+        return None
+
+    @staticmethod
+    def supports(language: str) -> bool:
+        lang = (language or "").strip().lower()
+        return not lang or lang.startswith("auto") or any(w in lang for w in LOCAL_LANG_WORDS)
+
+    @classmethod
+    def variant(cls, cfg: dict) -> str:
+        v = str(cfg["providers"]["local"].get("model", "small")).lower()
+        return v if v in cls.VARIANTS else "small"
+
+    def _engine(self, variant: str):
+        eng = self._engines.get(variant)
+        if eng is not None:
+            return eng
+        with self._build_lock:
+            eng = self._engines.get(variant)
+            if eng is not None:
+                return eng
+            err = self.problem()
+            if err:
+                raise OCRError(err, skip_provider=True)
+            try:
+                from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
+            except Exception as exc:
+                raise OCRError(f"Local OCR could not be imported: {exc}", skip_provider=True)
+            mtype = ModelType.MEDIUM if variant == "medium" else ModelType.SMALL
+            user_models = config_dir() / "models"
+            # small is bundled in the wheel (root=None); anything else downloads into our own folder
+            roots = [None, user_models] if variant == "small" else [user_models]
+            last = None
+            for root in roots:
+                params = {
+                    "Global.log_level": "error",
+                    "Global.max_side_len": 8192,  # we resize first, so the engine must not shrink it again
+                    "Global.use_cls": False,
+                    "Det.ocr_version": OCRVersion.PPOCRV6, "Det.model_type": mtype, "Det.limit_type": "max",
+                    "Rec.ocr_version": OCRVersion.PPOCRV6, "Rec.lang_type": LangRec.JAPAN, "Rec.model_type": mtype,
+                }
+                if root is not None:
+                    root.mkdir(parents=True, exist_ok=True)
+                    params["Global.model_root_dir"] = str(root)
+                try:
+                    eng = RapidOCR(params=params)
+                    break
+                except Exception as exc:
+                    last = exc
+            else:
+                hint = " Switch to the Small model, or check your internet connection for the one-time download." \
+                    if variant == "medium" else ""
+                raise OCRError(f"Local OCR could not load the {variant} model ({str(last)[:140]}).{hint}",
+                               skip_provider=True)
+            self._engines[variant] = eng
+            return eng
+
+    def warmup(self, cfg: dict) -> int:
+        t0 = time.perf_counter()
+        eng = self._engine(self.variant(cfg))
+        with self._run_lock:
+            eng(make_test_image(), use_cls=False)
+        return int((time.perf_counter() - t0) * 1000)
+
+    def recognize(self, img, cfg: dict) -> str:
+        lang = cfg.get("language", "")
+        if not self.supports(lang):
+            raise OCRError(f"Local OCR does not cover {lang}. Use Japanese, Chinese, English or a Latin-script "
+                           "language, or switch to a cloud provider.", skip_provider=True)
+        cap = min(4096, max(640, int(cfg.get("local_max_side", 1280))))
+        conf = min(0.99, max(0.2, int(cfg.get("local_min_conf", 70)) / 100.0))
+        rgb = img.convert("RGB")
+        w, h = rgb.size
+        if max(w, h) > cap:
+            s = cap / max(w, h)
+            rgb = rgb.resize((max(1, round(w * s)), max(1, round(h * s))), Image.Resampling.LANCZOS)
+        eng = self._engine(self.variant(cfg))
+        try:
+            with self._run_lock:
+                res = eng(rgb, use_cls=False, text_score=conf)
+        except Exception as exc:
+            raise OCRError(f"local OCR failed ({exc.__class__.__name__}: {str(exc)[:120]})")
+        return assemble_lines(getattr(res, "boxes", None), getattr(res, "txts", None),
+                              getattr(res, "scores", None), conf)
+
+    def selftest(self, cfg: dict):
+        self.warmup(cfg)
+        t0 = time.perf_counter()
+        text = self.recognize(make_test_image(), {**cfg, "language": "English"})
+        return text, int((time.perf_counter() - t0) * 1000)
 
 
 class OCRClient:
@@ -994,10 +1178,12 @@ class OCRClient:
         self.get_cfg = get_cfg
         self._idx = {}
         self._lock = threading.Lock()
+        self.local = LocalOCR()
 
-    @staticmethod
-    def eligible(pid: str, cfg: dict) -> bool:
+    def eligible(self, pid: str, cfg: dict) -> bool:
         p, pc = PROVIDER_BY_ID[pid], cfg["providers"][pid]
+        if p["kind"] == "local":
+            return self.local.problem() is None
         if not str(pc.get("model", "")).strip():
             return False
         if p["kind"] == "openai" and not str(pc.get("base_url", "")).strip():
@@ -1017,15 +1203,31 @@ class OCRClient:
                     order.append(p["id"])
         return order
 
-    def recognize(self, data: bytes, mime: str):
+    def recognize(self, img, max_side: int):
         cfg = self.get_cfg()
         chain = self.chain(cfg)
         if not chain:
-            raise OCRError("No provider is ready. Add an API key in the AI Keys tab.")
+            raise OCRError(self.local.problem() or "No provider is ready. Add an API key in the AI Keys tab.")
         prompt = build_prompt(cfg)
         errors = []
+        encoded = None  # PNG/JPEG encoding is only paid for when a cloud provider is actually used
         for pid in chain:
             pdef, pc = PROVIDER_BY_ID[pid], cfg["providers"][pid]
+            if pdef["kind"] == "local":
+                try:
+                    return self.local.recognize(img, cfg), pdef["name"]
+                except OCRError as exc:
+                    errors.append(f"{pdef['name']}: {exc}")
+                    continue
+            if encoded is None:
+                try:
+                    encoded = encode_image(img, max_side)
+                except OCRError as exc:
+                    errors.append(str(exc))
+                    encoded = False
+            if encoded is False:
+                continue
+            data, mime = encoded
             keys = parse_keys(pc.get("keys", "")) or ([""] if not pdef["needs_key"] else [])
             with self._lock:
                 start = self._idx.get(pid, 0) % len(keys)
@@ -1039,7 +1241,7 @@ class OCRClient:
                         break
                     continue
                 with self._lock:
-                    self._idx[pid] = i + 1  # rotate keys to spread free tier limits
+                    self._idx[pid] = i + 1  # rotate keys to spread free-tier limits
                 return clean_text(text), pdef["name"]
         raise OCRError(" | ".join(errors)[:600])
 
@@ -1095,7 +1297,9 @@ def frame_changed(a, b, threshold: float = 0.00005) -> bool:
     return ImageStat.Stat(diff).mean[0] / 255.0 > threshold
 
 
-#i don't even know if these work
+# hotkeys
+# again, these do not work
+
 class HotkeyManager:
     def __init__(self, emit):
         self.emit = emit
@@ -1213,8 +1417,9 @@ class Recorder(threading.Thread):
             self.stop_evt.wait(wait)
 
 
-#css shit
-
+# css bullshit 
+# this is vibecoded because i couldnt be bothered to style eveything, just tell it make it black and greay
+# that'll d the job
 QSS = """
 QWidget { background: transparent; color: #e6e6e8; font-size: 13px; }
 QMainWindow, QWidget#root { background: #0e0e0f; }
@@ -1401,6 +1606,9 @@ class ProviderCard(QFrame):
         head.addWidget(self.fallback)
         lay.addLayout(head)
         lay.addWidget(muted(pdef["note"]))
+        if pdef["kind"] == "local":
+            self._build_local(lay, pc)
+            return
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
@@ -1457,15 +1665,64 @@ class ProviderCard(QFrame):
         if self.base is not None:
             self.base.textChanged.connect(lambda _t: win.on_provider_edit(self))
 
+    def _build_local(self, lay, pc: dict):
+        win = self.win
+        self.base = self.key = self.get_btn = self.fetch_btn = None
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(1, 1)
+        grid.addWidget(QLabel("Model"), 0, 0)
+        self.model = QComboBox()
+        self.model.addItem("Small: fast, included with the install", "small")
+        self.model.addItem("Medium: more accurate, slower, one-time download", "medium")
+        self.model.setCurrentIndex(1 if pc.get("model") == "medium" else 0)
+        grid.addWidget(self.model, 0, 1, 1, 2)
+        self.conf_spin = QSpinBox()
+        self.conf_spin.setRange(20, 99)
+        self.conf_spin.setSuffix(" %")
+        self.conf_spin.setMinimumWidth(110)
+        win._bind_spin(self.conf_spin, "local_min_conf")
+        grid.addWidget(QLabel("Minimum confidence"), 1, 0)
+        grid.addWidget(self.conf_spin, 1, 1)
+        self.side_spin = QSpinBox()
+        self.side_spin.setRange(640, 4096)
+        self.side_spin.setSingleStep(128)
+        self.side_spin.setSuffix(" px")
+        self.side_spin.setMinimumWidth(110)
+        win._bind_spin(self.side_spin, "local_max_side")
+        grid.addWidget(QLabel("Largest image side"), 2, 0)
+        grid.addWidget(self.side_spin, 2, 1)
+        lay.addLayout(grid)
+        lay.addWidget(muted("Lines scoring below the minimum confidence are dropped, never guessed. Raise it if junk "
+                            "gets through; lower it if real text goes missing. Bigger images read small text better "
+                            "but are slower. Supports Japanese, Chinese, English and Latin-script languages (not "
+                            "Korean, Russian, Arabic, Hindi or Thai)."))
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setVisible(False)
+        self.test_btn = QPushButton("Test")
+        self.test_btn.clicked.connect(lambda: win.test_provider(self))
+        lay.addLayout(h_row(self.test_btn, stretch_end=True))
+        lay.addWidget(self.status)
+        self.fallback.setChecked(bool(pc["fallback"]))
+        self.model.currentIndexChanged.connect(lambda _i: win.on_provider_edit(self))
+        self.fallback.toggled.connect(lambda _v: win.on_provider_edit(self))
+
     def _toggle_show(self, on: bool):
         self.key.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
         self.show_btn.setText("Hide" if on else "Show")
 
     def first_key(self) -> str:
+        if self.key is None:
+            return ""
         keys = parse_keys(self.key.text())
         return keys[0] if keys else ""
 
     def snapshot(self) -> dict:
+        if self.pdef["kind"] == "local":
+            return {"keys": "", "model": self.model.currentData() or "small", "base_url": "",
+                    "fallback": self.fallback.isChecked()}
         return {
             "keys": self.key.text().strip(),
             "model": self.model.currentText().strip(),
@@ -1488,7 +1745,7 @@ class ProviderCard(QFrame):
         self.status.setVisible(bool(text))
 
 
-# main window
+# MAIN WINDOW
 
 class MainWindow(QMainWindow):
     def __init__(self, cfg: Config, bus: Bus, capturer: Capturer, ocr: OCRClient, sink: TextSink, ipc_ok: bool):
@@ -1572,12 +1829,18 @@ class MainWindow(QMainWindow):
         prob = self.capturer.problem(need_region=True)
         if prob:
             self.add_log("warn", prob)
+        local_err = self.ocr.local.problem()
+        if local_err is not None and self.d["active_provider"] == "local":
+            self.add_log("warn", local_err)
         if not self.ocr.chain(self.d):
-            self.add_log("warn", "No AI provider is ready yet. Open the AI Keys tab and add a free key.")
+            self.add_log("warn", "No OCR provider is ready yet. Install Local OCR (no key needed) or add a free key "
+                                 "in the AI Keys tab.")
+        elif "local" in self.ocr.chain(self.d):
+            self.warm_local()
         if not self.ipc_ok:
             self.add_log("warn", "Could not open the command channel; --trigger hotkeys will not work.")
 
-    # UI 
+    # ui
     def _build_ui(self):
         root = QWidget()
         root.setObjectName("root")
@@ -1600,7 +1863,7 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         self.nav_btns = []
-        for i, name in enumerate(("Capture", "AI Keys", "Settings")):
+        for i, name in enumerate(("Capture", "OCR Mode", "Settings")):
             b = QPushButton(name)
             b.setObjectName("nav")
             b.setCheckable(True)
@@ -1633,7 +1896,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(16)
         return w, lay
 
-    #  capture page
+    # capture page
     def _build_capture_page(self):
         page, lay = self._page()
         h, s = page_header("Capture", "Read the whole screen, or just a region. New text is appended to your output file.")
@@ -1721,10 +1984,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(card3, 1)
         return scroll_wrap(page)
 
-    # AI keys page
+    # ai keys page
     def _build_keys_page(self):
         page, lay = self._page()
-        h, s = page_header("AI Keys", "Pick the provider that reads your screen. Free tiers are enough for personal use.")
+        h, s = page_header("AI Keys", "Pick what reads your screen. Local OCR needs no key; cloud providers have free tiers.")
         lay.addWidget(h)
         lay.addWidget(s)
 
@@ -1733,7 +1996,7 @@ class MainWindow(QMainWindow):
         self.fallback_chk.toggled.connect(lambda v: self.set_cfg("fallback", bool(v)))
         lay.addWidget(self.fallback_chk)
         lay.addWidget(muted("Tip: paste several keys (comma separated) into one provider and they are used in turn, "
-                            "which stretches free-tier rate limits. Screenshots are sent to the provider you choose."))
+                            "which stretches free-tier rate limits. Screenshots are sent to the cloud provider you choose; Local OCR never leaves this computer."))
 
         self.active_group = QButtonGroup(self)
         self.active_group.setExclusive(True)
@@ -1742,12 +2005,32 @@ class MainWindow(QMainWindow):
             self.cards[pdef["id"]] = card
             self.active_group.addButton(card.active)
             card.active.setChecked(self.d["active_provider"] == pdef["id"])
-            card.active.toggled.connect(lambda on, pid=pdef["id"]: on and self.set_cfg("active_provider", pid))
+            card.active.toggled.connect(lambda on, pid=pdef["id"]: self._active_changed(pid, on))
             lay.addWidget(card)
         lay.addStretch(1)
         return scroll_wrap(page)
 
-    # settings page
+    def _active_changed(self, pid: str, on: bool):
+        if not on:
+            return
+        self.set_cfg("active_provider", pid)
+        if pid == "local":
+            self.warm_local()
+
+    def warm_local(self):
+        """Load the local engine in the background so the first real scan is not the slow one."""
+        if self.ocr.local.problem() is not None:
+            return
+
+        def work():
+            try:
+                ms = self.ocr.local.warmup(self.d)
+                self.bus.log.emit("ok", f"Local OCR engine ready ({ms} ms).")
+            except Exception as exc:
+                self.bus.log.emit("err", f"Local OCR: {exc}")
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- settings page
     def _bind_check(self, chk: QCheckBox, key: str):
         chk.setChecked(bool(self.d[key]))
         chk.toggled.connect(lambda v, k=key: self.set_cfg(k, bool(v)))
@@ -1800,7 +2083,7 @@ class MainWindow(QMainWindow):
         self.spin_side.setSuffix(" px")
         self.spin_side.setMinimumWidth(130)
         self._bind_spin(self.spin_side, "max_side")
-        cl.addLayout(h_row(QLabel("Largest image side sent to the AI"), self.spin_side, stretch_end=True))
+        cl.addLayout(h_row(QLabel("Largest image side sent to cloud AI"), self.spin_side, stretch_end=True))
         lay.addWidget(card)
 
         # ocr
@@ -1816,6 +2099,7 @@ class MainWindow(QMainWindow):
         self.extra_edit.setPlaceholderText("Optional extra instructions, e.g. 'only read the subtitles at the bottom'")
         self.extra_edit.textChanged.connect(lambda t: self.set_cfg("extra_prompt", t.strip()))
         cl.addWidget(self.extra_edit)
+        cl.addWidget(muted("Extra instructions apply to cloud providers only. Local OCR reads exactly what is printed."))
         lay.addWidget(card)
 
         # hotkeys
@@ -1965,6 +2249,8 @@ class MainWindow(QMainWindow):
     def on_provider_edit(self, card: ProviderCard):
         self.d["providers"][card.pdef["id"]] = {**self.d["providers"][card.pdef["id"]], **card.snapshot()}
         self.save_soon()
+        if card.pdef["kind"] == "local" and "local" in self.ocr.chain(self.d):
+            self.warm_local()
 
     def fetch_models(self, card: ProviderCard):
         pdef, snap, key = card.pdef, card.snapshot(), card.first_key()
@@ -1992,8 +2278,19 @@ class MainWindow(QMainWindow):
         if pdef["needs_key"] and not key:
             card.set_status("Enter an API key first.", "err")
             return
-        card.set_status("Testing with a sample image...")
         cfg_copy = dict(self.d)
+        if pdef["kind"] == "local":
+            card.set_status("Loading the local engine and reading a sample image...")
+
+            def work_local():
+                try:
+                    text, ms = self.ocr.local.selftest(cfg_copy)
+                    self.bus.test_done.emit(pdef["id"], "TEST" in text.upper(), f"{text or '(nothing read)'}  [{ms} ms]")
+                except Exception as exc:
+                    self.bus.test_done.emit(pdef["id"], False, f"ERROR:{exc}")
+            threading.Thread(target=work_local, daemon=True).start()
+            return
+        card.set_status("Testing with a sample image...")
 
         def work():
             try:
@@ -2009,11 +2306,11 @@ class MainWindow(QMainWindow):
         if text.startswith("ERROR:"):
             card.set_status(text[6:], "err")
         elif ok:
-            card.set_status(f"Works. The model read: {text.replace(chr(10), ' / ')}", "ok")
+            card.set_status(f"Works. Read: {text.replace(chr(10), ' / ')}", "ok")
         else:
-            card.set_status(f"The API answered but did not read the sample correctly: {text[:120]}", "warn")
+            card.set_status(f"It answered but did not read the sample correctly: {text[:120]}", "warn")
 
-    # monitormode
+    
     def _set_mode(self, mode: str):
         self.set_cfg("mode", mode)
         self._apply_mode_ui()
@@ -2046,7 +2343,7 @@ class MainWindow(QMainWindow):
         if key is not None:
             self.set_cfg("monitor", key)
 
-    
+   
     def _set_state(self, state: str):
         self.state = state
         idle = state == "idle"
@@ -2071,7 +2368,7 @@ class MainWindow(QMainWindow):
             self.add_log("err", prob)
             return False
         if not self.ocr.chain(self.d):
-            self.add_log("err", "No AI provider is ready. Add a key in the AI Keys tab.")
+            self.add_log("err", self.ocr.local.problem() or "No OCR provider is ready. Add a key in the AI Keys tab.")
             self.show_page(1)
             return False
         return True
@@ -2130,7 +2427,7 @@ class MainWindow(QMainWindow):
             self._set_state("idle")
             self.notify(APP_NAME, "Recording stopped after repeated errors.")
 
-    # region selection
+   # region select
     def pick_region_clicked(self):
         prob = self.capturer.problem(need_region=True)
         if prob:
@@ -2201,7 +2498,7 @@ class MainWindow(QMainWindow):
         if cb:
             cb(None if err else region, None if err else img)
 
-   # scan region  and read
+    # one shot scan
     def one_shot(self):
         if self._oneshot_busy or self._selecting:
             return
@@ -2227,10 +2524,9 @@ class MainWindow(QMainWindow):
         finally:
             self._oneshot_busy = False
 
-    # pipeline
+    
     def process_image(self, img, force: bool = False):
-        data, mime = encode_image(img, self.d["max_side"])
-        text, provider = self.ocr.recognize(data, mime)
+        text, provider = self.ocr.recognize(img, self.d["max_side"])
         written = self.sink.write(text, force=force) if text else 0
         return text, written, provider
 
