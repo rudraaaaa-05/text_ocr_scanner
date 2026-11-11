@@ -1,6 +1,6 @@
 # OCR Scanner
 
-Read text from your screen with **offline local OCR** or free (and paid) AI APIs, and append it to a plain text file, one line per line of text. Every launch writes to its own new file.
+Read text from your screen with **offline local OCR** or free (and paid) AI APIs, and append it to a plain text file, one line per line of text.
 
 ## Features
 
@@ -8,7 +8,6 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 - **Region recording**: pick a region once, then record only that
 - **Select a new region and scan**: press a key, drag a region, text is read once. Repeat for each scan
 - **Scan current**: press a key and the *already configured* target is read once, with no selector: the stored region in region mode, the configured monitor (or all monitors) in full-screen mode
-- **One output file per launch**: see [Output files](#output-files)
 - **Local OCR (offline)**: reads text on your computer. No API key, no upload, no rate limits. It scores every line and drops anything it is unsure of instead of guessing
 - **AI OCR**: optional cloud providers (Gemini, Groq, OpenRouter, Mistral, DeepSeek, Ollama or any OpenAI-compatible endpoint). Local OCR can serve as the automatic fallback when one fails
 
@@ -19,8 +18,8 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 | Linux, Hyprland / sway / other wlroots Wayland | Primary target (uses `grim` + `slurp`; hotkeys via compositor binds and `--trigger`) |
 | Linux, X11 | Supported (built-in region selector, `mss` capture, global hotkeys via `pynput`) |
 | Linux, GNOME / KDE on Wayland | Not supported (use an X11 session) |
-| Windows | Supported by design (same Qt selector, `mss`, `pynput`). The coordinate mapping (negative monitor origins, display scaling) and hotkey logic are unit-tested, but the app has **not** been verified on real Windows hardware yet |
-| macOS | Written for, not tested |
+| Windows | Supported by design (same Qt selector, `mss`, `pynput`). The coordinate mapping (negative monitor origins, display scaling) and hotkey logic are unit-tested, work in progress|
+| macOS | Written for, work in progress |
 
 ### System requirements per platform
 
@@ -130,15 +129,6 @@ Wayland apps cannot grab global keys, so you bind keys in your compositor to cal
 hl.bind("CTRL + ALT + O", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger region"))
 hl.bind("CTRL + ALT + S", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger current"))
 ```
-
-hyprlang:
-
-```
-bind = CTRL ALT, O, exec, /path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger region
-bind = CTRL ALT, S, exec, /path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger current
-```
-
-The Wayland path (`grim` + `slurp`) was not run in the development environment of this release; see *Testing* below.
 
 ## Testing
 
