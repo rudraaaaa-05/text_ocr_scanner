@@ -8,6 +8,7 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 - **Region recording**: pick a region once, then record only that
 - **Select a new region and scan**: press a key, drag a region, text is read once. Repeat for each scan
 - **Scan current**: press a key and the *already configured* target is read once, with no selector: the stored region in region mode, the configured monitor (or all monitors) in full-screen mode
+- **Background daemon**: recording, hotkeys and OCR keep running when the window is closed; autostart via a systemd user service (Linux) or a startup entry (Windows)
 - **Local OCR (offline)**: reads text on your computer. No API key, no upload, no rate limits. It scores every line and drops anything it is unsure of instead of guessing
 - **AI OCR**: optional cloud providers (Gemini, Groq, OpenRouter, Mistral, DeepSeek, Ollama or any OpenAI-compatible endpoint). Local OCR can serve as the automatic fallback when one fails
 
@@ -80,18 +81,42 @@ What it covers:
 - **Vertical Japanese** is only lightly tested, and right-to-left column order is not handled.
 - The engine loads in the background at startup, so the first scan is not the slow one.
 
+## Background daemon
+
+Capture, OCR, recording, hotkeys and the output file run in a **background daemon** (`ocr_daemon.py`, no PySide6 needed). The window (`ocr_scanner.py`) is a client of it. **Closing the window does not stop recording.** Opening the window again reconnects to the running daemon; if none is running, the window starts one. A second daemon can never start (OS file lock). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+Linux (from the project folder; `run_daemon.sh` uses the same virtualenv as `run.sh`):
+
+```bash
+./run_daemon.sh start              # start daemon and tray GUI in the background (no-op if running)
+./run_daemon.sh status             # state, scans, output file, hotkeys, GUI connected?
+./run_daemon.sh stop               # graceful shutdown
+./run_daemon.sh run                # foreground, for debugging
+./run_daemon.sh autostart enable   # install + enable + start daemon and tray GUI at login (no root)
+./run_daemon.sh autostart disable
+./run_daemon.sh autostart status
+./run_daemon.sh service restart    # systemctl --user start|stop|restart|status
+journalctl --user -u ocr-scanner.service -f   # daemon log; GUI service: ocr-scanner-gui.service
+```
+
+Windows: `run_daemon.bat start | stop | status | autostart enable | autostart disable | autostart status`. Autostart writes a per-user `Run` registry value (no administrator needed).
+
+Run `autostart enable` from the same virtualenv you use for the app: the unit / registry value records that Python.
+
+Tray menu (when a tray is available): **Open Window**, **Open Output Folder**, and **Stop Daemon**. Closing the window hides it in the tray; **Stop Daemon** closes both the GUI and daemon.
+
 ## Output files
 
-Every time the app is launched it creates a **new** output file and uses it for everything it reads during that launch. The name comes from the *Output file* path in Settings plus the launch time:
+Every time the **daemon** starts it creates a **new** output file and uses it for everything it reads until it exits. Opening and closing the window does not change the file. The name comes from the *Output file* path in Settings plus the launch time:
 
 ```
 ocr_output.txt   ->   ocr_output_2026-01-31_14-05-09.txt
 ```
 
 - Files from earlier launches are never opened for writing, so they are never overwritten or changed. The new file is created exclusively; if the name is taken (two launches in the same second) a `_2`, `_3`, ... suffix is added.
-- The path you set is only the base name. Changing it applies from the **next** launch; the running session keeps its file. The active file is shown in Settings.
+- The path you set is only the base name. Changing it applies the next time the **daemon** starts; the running session keeps its file. The active file is shown in Settings.
 - **Open Output File** and **Open Output Folder** (Settings and the tray menu) always refer to the active session file.
-- Duplicate filtering ("skip identical text", "only save new lines") works across the whole launch, including across Start/Stop and scans.
+- Duplicate filtering ("skip identical text", "only save new lines") works for the daemon's whole run, including across Start/Stop and scans.
 
 ## Capture modes
 
@@ -115,11 +140,11 @@ There are two different scan actions:
 
 The stored region is set with **Select region** on the Capture page (or when you start region recording without one). If region mode has no valid stored region, *Scan current* shows an error and does nothing else.
 
-Other triggers: `start`, `stop`, `show`. All of them: `region`, `current`, `toggle`, `start`, `stop`, `pause`, `show`. The app must already be running.
+Other triggers: `start`, `stop`, `show`, plus `resume` (resume only; `pause` toggles) and `status` / `shutdown`. All of them: `region`, `current`, `toggle`, `start`, `stop`, `pause`, `show`, `resume`, `status`, `shutdown`. The **daemon** must be running (`python ocr_daemon.py start`, or open the window once). `ocr_scanner.py --trigger ...` is unchanged and does not need Qt. If region mode has no valid stored region, `start` / `toggle` report an error instead of opening a selector (use *Select region* in the window first).
 
 ### Windows, X11, macOS
 
-Global hotkeys run inside the app through `pynput` and can be changed in Settings. If registration fails (pynput missing, no X display, a key assigned twice, macOS permissions) the reason is shown in Settings, in the activity log and as a notification; nothing fails silently. Hotkeys are released when the app exits. Two actions cannot share one key.
+Global hotkeys run inside the daemon through `pynput` and can be changed in Settings. If registration fails (pynput missing, no X display, a key assigned twice, macOS permissions) the reason is shown in Settings, in the activity log and as a notification; nothing fails silently. Hotkeys keep working with the window closed and are released when the daemon exits. Two actions cannot share one key.
 
 ### Wayland
 
@@ -136,7 +161,7 @@ hl.bind("CTRL + ALT + S", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/oc
 python -m unittest discover -s tests -v
 ```
 
-The tests cover session files, duplicate filtering, region validation, coordinate mapping (negative origins, display scaling, multiple monitors), full-screen / region routing, scan-current, hotkey mapping and cleanup, and shutdown handling. They do not need a display or PySide6. They do **not** exercise the real Qt overlay, tray, `pynput` or `grim`/`slurp`; verify those by hand on your platform.
+`tests/test_ocr_scanner.py` covers the Qt-free logic and `tests/test_daemon.py` covers the daemon: it starts real daemon processes in a temporary config dir (duplicate prevention, SIGTERM, crash recovery, `--trigger`, GUI link reconnect), plus IPC validation/timeouts/tokens, autostart (fake `systemctl` / registry) and commands with fake capture/OCR. Together they cover session files, duplicate filtering, region validation, coordinate mapping (negative origins, display scaling, multiple monitors), full-screen / region routing, scan-current, hotkey mapping and cleanup, and shutdown handling. They do not need a display or PySide6; the daemon test also proves the daemon modules import without it. They do **not** exercise the real Qt overlay, tray, `pynput` or `grim`/`slurp`; verify those by hand on your platform, together with a real `systemctl --user` enable and the Windows startup entry.
 
 ## Privacy
 
@@ -154,7 +179,9 @@ The tests cover session files, duplicate filtering, region validation, coordinat
 | Problem | Fix |
 |---|---|
 | `grim` / `slurp` not found | Install them (`sudo pacman -S grim slurp`) |
-| Hotkey does nothing on Wayland | Add the compositor binds from Settings and make sure the app is running |
+| Hotkey does nothing on Wayland | Add the compositor binds from Settings and make sure the daemon is running (`./run_daemon.sh status`) |
+| `--trigger` says the daemon is not running | `./run_daemon.sh start`, or open the window once |
+| Daemon works from a terminal but not from systemd | The service needs your session's `DISPLAY` / `WAYLAND_DISPLAY`. `autostart enable` imports them; re-run it from inside your desktop session. On Hyprland, the autostart setup also restarts both OCR services from the compositor startup hook so they come back after a manual stop on the previous login |
 | Hotkeys fail on Windows / X11 | Read the message in Settings. Install `pynput` (`pip install pynput`) and check that no two actions share a key |
 | "Scan current" says the region is not usable | The stored region is missing, empty, off-screen, or from another monitor layout. Select it again on the Capture page |
 | HTTP 404 on a model | Model was renamed or retired. Use **Fetch models** |
@@ -179,15 +206,10 @@ The tests cover session files, duplicate filtering, region validation, coordinat
 
 ## Roadmap
 
-The goal is to grow this from a script into a proper installable app that runs quietly in the background and works fully on Windows, macOS and Linux. Nothing below is done yet. It is ordered roughly by priority.
+The goal is to grow this from a script into a proper installable app that runs quietly in the background and works fully on Windows, macOS and Linux. Items 2 onward are not done yet. It is ordered roughly by priority.
 
 ### 1. Background service
-The GUI, capture loop, hotkeys and command channel all live in one process. The plan is to split them:
-
-- **Core daemon**: capture, OCR, file writing, hotkeys and the command channel, with no GUI dependency.
-- **GUI**: a thin client that talks to the daemon. Closing the window no longer stops recording.
-- **Autostart per platform**: a systemd user service on Linux, a LaunchAgent on macOS, and a startup entry or scheduled task on Windows.
-- **System tray**: start/stop, scan region, open settings. The existing `--trigger` command channel is the starting point for this IPC.
+**Phase 1 is done for Linux and Windows**: the core daemon, the thin GUI, per-user IPC, tray actions, systemd user service and Windows startup entry (see [Background daemon](#background-daemon)). Not done: a macOS LaunchAgent, and moving API keys out of `config.json` (planned, deliberately not part of Phase 1).
 
 ### 2. Packaging
 Goal: install it without touching Python or a terminal.

@@ -18,7 +18,8 @@ sys.path.insert(0, str(HERE.parent))
 import qt_stub  # noqa: E402
 
 qt_stub.install_if_missing()
-import ocr_scanner as o  # noqa: E402
+import ocr_core as core  # noqa: E402
+import ocr_scanner as o  # noqa: E402  (GUI module; re-exports everything from ocr_core)
 from PIL import Image  # noqa: E402
 
 DUAL = [  # a second monitor LEFT of the primary: negative coordinates
@@ -252,7 +253,7 @@ class CaptureRoutingTests(unittest.TestCase):
         patcher = mock.patch.dict(sys.modules, self.fake.modules)
         patcher.start()
         self.addCleanup(patcher.stop)
-        with mock.patch.object(o, "is_wayland", return_value=False), mock.patch.object(o, "is_hyprland", return_value=False):
+        with mock.patch.object(core, "is_wayland", return_value=False), mock.patch.object(core, "is_hyprland", return_value=False):
             self.cap = o.Capturer()
 
     def region(self, **kw):
@@ -370,7 +371,7 @@ class HotkeyTests(unittest.TestCase):
         FakeListener.instances = []
         self.cmds = []
         self.mgr = o.HotkeyManager(self.cmds.append, backend=FakeBackend)
-        p = mock.patch.object(o, "is_wayland", return_value=False)
+        p = mock.patch.object(core, "is_wayland", return_value=False)
         p.start()
         self.addCleanup(p.stop)
 
@@ -463,7 +464,7 @@ class HotkeyTests(unittest.TestCase):
         self.assertFalse(self.mgr.running)
 
     def test_wayland_is_informational_and_registers_nothing(self):
-        with mock.patch.object(o, "is_wayland", return_value=True):
+        with mock.patch.object(core, "is_wayland", return_value=True):
             ok, msg, level = self.mgr.apply(o.default_config()["hotkeys"])
         self.assertEqual(level, "info")
         self.assertEqual(FakeListener.instances, [])
