@@ -1,12 +1,14 @@
 # OCR Scanner
 
-Read text from your screen with **offline local OCR** or free (and paid) AI APIs, and append it to a plain text file, one line per line of text.
+Read text from your screen with **offline local OCR** or free (and paid) AI APIs, and append it to a plain text file, one line per line of text. Every launch writes to its own new file.
 
 ## Features
 
 - **Full-screen recording** with Start / Pause / Stop
 - **Region recording**: pick a region once, then record only that
-- **Hotkey scan**: press a key, drag a region, text is read once. Repeat for each scan
+- **Select a new region and scan**: press a key, drag a region, text is read once. Repeat for each scan
+- **Scan current**: press a key and the *already configured* target is read once, with no selector: the stored region in region mode, the configured monitor (or all monitors) in full-screen mode
+- **One output file per launch**: see [Output files](#output-files)
 - **Local OCR (offline)**: reads text on your computer. No API key, no upload, no rate limits. It scores every line and drops anything it is unsure of instead of guessing
 - **AI OCR**: optional cloud providers (Gemini, Groq, OpenRouter, Mistral, DeepSeek, Ollama or any OpenAI-compatible endpoint). Local OCR can serve as the automatic fallback when one fails
 
@@ -14,10 +16,17 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 
 | Platform | Status |
 |---|---|
-| Linux, Hyprland / sway / other wlroots Wayland | Primary target (uses `grim` + `slurp`) |
-| Linux, X11 | Supported (built-in region selector and global hotkeys) |
+| Linux, Hyprland / sway / other wlroots Wayland | Primary target (uses `grim` + `slurp`; hotkeys via compositor binds and `--trigger`) |
+| Linux, X11 | Supported (built-in region selector, `mss` capture, global hotkeys via `pynput`) |
 | Linux, GNOME / KDE on Wayland | Not supported (use an X11 session) |
-| Windows, macOS | Written for, but not tested |
+| Windows | Supported by design (same Qt selector, `mss`, `pynput`). The coordinate mapping (negative monitor origins, display scaling) and hotkey logic are unit-tested, but the app has **not** been verified on real Windows hardware yet |
+| macOS | Written for, not tested |
+
+### System requirements per platform
+
+- **Windows / Linux X11 / macOS:** the Python packages in `requirements.txt` (`PySide6`, `Pillow`, `requests`, `mss`, `pynput`, a local OCR engine). Nothing else.
+- **Linux Wayland (Hyprland, sway, ...):** `grim` (screenshots) and `slurp` (region selector), e.g. `sudo pacman -S grim slurp`. `hyprctl` is used on Hyprland to list and pick monitors. `pynput` is installed but not used on Wayland.
+- **Region selection limits:** on Wayland the stored region is checked for a valid shape and size only. It cannot be checked against monitor changes, so after changing your monitor setup select the region again. On X11 / Windows it is checked against the current monitors automatically (see below).
 
 ## Install
 
@@ -32,7 +41,7 @@ cd text_ocr_scanner
 ./run.sh          # Windows: run.bat
 ```
 
-`run.sh` creates a private virtualenv, installs `requirements.txt`, and launches the app. `requirements.txt` includes `rapidocr` and `onnxruntime`, which power Local OCR. The default model ships inside the `rapidocr` package, so no extra download is needed.
+`run.sh` creates a private virtualenv, installs `requirements.txt`, and launches the app. `requirements.txt` includes `pynput` (global hotkeys on Windows and X11) and the local OCR packages. The default model ships inside the `rapidocr` package, so no extra download is needed.
 
 ## Setup
 
@@ -41,8 +50,8 @@ cd text_ocr_scanner
 1. Open the **AI Keys** tab and select **Local OCR (offline)** with its radio button. It is the default on a fresh install.
 2. Press **Test**. The first press loads the engine, then it should report `Works. Read: OCR TEST 123`.
 3. Open **Settings** and set the **Language of the text** (Japanese, Chinese, English or a Latin-script language).
-4. Open **Settings** and choose where the text file is saved.
-5. Go to **Capture** and press Start, or use the region hotkey.
+4. Open **Settings** and choose the output file name (a timestamp is added per launch, see [Output files](#output-files)).
+5. Go to **Capture** and press Start, or use one of the scan hotkeys.
 
 ### Option B: Cloud AI
 
@@ -72,22 +81,72 @@ What it covers:
 - **Vertical Japanese** is only lightly tested, and right-to-left column order is not handled.
 - The engine loads in the background at startup, so the first scan is not the slow one.
 
+## Output files
+
+Every time the app is launched it creates a **new** output file and uses it for everything it reads during that launch. The name comes from the *Output file* path in Settings plus the launch time:
+
+```
+ocr_output.txt   ->   ocr_output_2026-01-31_14-05-09.txt
+```
+
+- Files from earlier launches are never opened for writing, so they are never overwritten or changed. The new file is created exclusively; if the name is taken (two launches in the same second) a `_2`, `_3`, ... suffix is added.
+- The path you set is only the base name. Changing it applies from the **next** launch; the running session keeps its file. The active file is shown in Settings.
+- **Open Output File** and **Open Output Folder** (Settings and the tray menu) always refer to the active session file.
+- Duplicate filtering ("skip identical text", "only save new lines") works across the whole launch, including across Start/Stop and scans.
+
+## Capture modes
+
+- **Full screen**: reads the monitor chosen on the Capture page, or all monitors.
+- **Region**: reads only the stored region. A region is never silently replaced by a full-screen capture; if it is missing or invalid you get an error and no OCR runs.
+
+A stored region is rejected when it is empty, has zero or negative size, lies outside the current desktop, or (X11 / Windows) was selected on a different monitor layout than the current one, because the same coordinates could then point at different content. Select the region again to fix it. Monitors may sit at negative coordinates and have different display scaling; the selection is mapped to physical screenshot pixels.
+
+Pressing **Escape** or right-click cancels a selection. A cancelled or too-small (< 8 px) selection never runs OCR.
+
 ## Hotkeys
 
-On X11, Windows and macOS the hotkeys work inside the app. Wayland apps cannot grab global keys, so on Hyprland you bind them in your compositor.
-Example (Hyprland Lua):
+There are two different scan actions:
+
+| Action | Default key | `--trigger` | What it does |
+|---|---|---|---|
+| **Select a new region and scan** | `Ctrl+Alt+O` | `region` | Opens the selector, reads the area you drag once. The region is **not** stored |
+| **Scan current** | `Ctrl+Alt+S` | `current` | No selector. Region mode: reads the **stored** region. Full-screen mode: reads the configured monitor / all monitors. Works while recording is stopped and the window is unfocused or hidden. Duplicate filtering applies |
+| Start / stop recording | `Ctrl+Alt+R` | `toggle` | |
+| Pause / resume | `Ctrl+Alt+P` | `pause` | |
+
+The stored region is set with **Select region** on the Capture page (or when you start region recording without one). If region mode has no valid stored region, *Scan current* shows an error and does nothing else.
+
+Other triggers: `start`, `stop`, `show`. All of them: `region`, `current`, `toggle`, `start`, `stop`, `pause`, `show`. The app must already be running.
+
+### Windows, X11, macOS
+
+Global hotkeys run inside the app through `pynput` and can be changed in Settings. If registration fails (pynput missing, no X display, a key assigned twice, macOS permissions) the reason is shown in Settings, in the activity log and as a notification; nothing fails silently. Hotkeys are released when the app exits. Two actions cannot share one key.
+
+### Wayland
+
+Wayland apps cannot grab global keys, so you bind keys in your compositor to call `--trigger`. Settings shows ready-made lines for your keys. Example (Hyprland Lua):
 
 ```lua
 hl.bind("CTRL + ALT + O", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger region"))
+hl.bind("CTRL + ALT + S", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger current"))
 ```
 
 hyprlang:
 
 ```
 bind = CTRL ALT, O, exec, /path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger region
+bind = CTRL ALT, S, exec, /path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger current
 ```
 
-Available triggers: `region`, `toggle`, `start`, `stop`, `pause`, `show`. The app must already be running.
+The Wayland path (`grim` + `slurp`) was not run in the development environment of this release; see *Testing* below.
+
+## Testing
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests cover session files, duplicate filtering, region validation, coordinate mapping (negative origins, display scaling, multiple monitors), full-screen / region routing, scan-current, hotkey mapping and cleanup, and shutdown handling. They do not need a display or PySide6. They do **not** exercise the real Qt overlay, tray, `pynput` or `grim`/`slurp`; verify those by hand on your platform.
 
 ## Privacy
 
@@ -106,6 +165,8 @@ Available triggers: `region`, `toggle`, `start`, `stop`, `pause`, `show`. The ap
 |---|---|
 | `grim` / `slurp` not found | Install them (`sudo pacman -S grim slurp`) |
 | Hotkey does nothing on Wayland | Add the compositor binds from Settings and make sure the app is running |
+| Hotkeys fail on Windows / X11 | Read the message in Settings. Install `pynput` (`pip install pynput`) and check that no two actions share a key |
+| "Scan current" says the region is not usable | The stored region is missing, empty, off-screen, or from another monitor layout. Select it again on the Capture page |
 | HTTP 404 on a model | Model was renamed or retired. Use **Fetch models** |
 | HTTP 429 | Rate limit. Raise the delay, add more keys, or switch to Local OCR |
 | "Local OCR is not installed" | Run `pip install rapidocr onnxruntime` in the app's virtualenv. Needs Python 3.11+ |

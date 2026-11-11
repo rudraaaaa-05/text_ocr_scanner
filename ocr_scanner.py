@@ -5,6 +5,7 @@ import html
 import importlib.util
 import io
 import json
+import logging
 import os
 import re
 import shlex
@@ -15,22 +16,27 @@ import sys
 import threading
 import time
 import webbrowser
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "OCR Scanner"
 APP_ID = "ocr-scanner"
-VERSION = "1.1"
+VERSION = "1.2"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 SCRIPT_PATH = os.path.abspath(__file__)
-VALID_COMMANDS = ("region", "toggle", "start", "stop", "pause", "show")
+# region  = pick a NEW region and scan it once
+# current = scan what is already configured (stored region, or the configured screen) without a selector
+VALID_COMMANDS = ("region", "current", "toggle", "start", "stop", "pause", "show")
+MIN_SELECTION_PX = 8  # smaller drags are treated as accidental clicks and never reach OCR
+log = logging.getLogger("ocr_scanner")
 
 
 #platform detection helpers
-#made this using hyprland arch linux so i have no idea if it works on other distros or non-hyprland
-#でも、きっと大丈夫だと思う
+#arch linuxのHyprLandで作ったから他の環境で動くかはわからない、
+#きっと大丈夫だと思う
 
 def is_wayland() -> bool:
     return IS_LINUX and (
@@ -246,9 +252,11 @@ PROVIDERS = [
 ]
 PROVIDER_BY_ID = {p["id"]: p for p in PROVIDERS}
 
-HOTKEY_DEFAULTS = {"region": "Ctrl+Alt+O", "toggle": "Ctrl+Alt+R", "pause": "Ctrl+Alt+P"}
+HOTKEY_ORDER = ("region", "current", "toggle", "pause")
+HOTKEY_DEFAULTS = {"region": "Ctrl+Alt+O", "current": "Ctrl+Alt+S", "toggle": "Ctrl+Alt+R", "pause": "Ctrl+Alt+P"}
 HOTKEY_LABELS = {
-    "region": "Scan a region once",
+    "region": "Select a new region and scan it once",
+    "current": "Scan the stored region / configured screen",
     "toggle": "Start / stop recording",
     "pause": "Pause / resume",
 }
@@ -330,6 +338,7 @@ class Config:
             self.data["mode"] = "full"
 
     def save(self):
+        """Write the config. Returns None on success, otherwise a readable error (never silent)."""
         with self._lock:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -341,8 +350,10 @@ class Config:
                 os.replace(tmp, self.path)
                 if not IS_WINDOWS:
                     os.chmod(self.path, 0o600)  # the file holds API keys
-            except OSError:
-                pass
+            except OSError as exc:
+                log.error("Could not save the config to %s: %s", self.path, exc)
+                return f"Could not save settings to {self.path}: {exc.strerror or exc}"
+        return None
 
 
 #for hotkey stuff
@@ -444,7 +455,7 @@ def hypr_snippet(hotkeys: dict, syntax: str) -> str:
         lines.append("-- add to ~/.config/hypr/hyprland.lua, then run: hyprctl reload")
     else:
         lines.append("# add to ~/.config/hypr/hyprland.conf, then run: hyprctl reload")
-    for action in ("region", "toggle", "pause"):
+    for action in HOTKEY_ORDER:
         seq = hotkeys.get(action) or ""
         combo = hypr_combo(seq, syntax) if seq else None
         if not combo:
@@ -456,9 +467,73 @@ def hypr_snippet(hotkeys: dict, syntax: str) -> str:
             lines.append(f"bind = {combo}, exec, {cmd}  # {HOTKEY_LABELS[action]}")
     lines.append("")
     lines.append("Other compositors / desktops: bind your own shortcut to these commands:")
-    for action in ("region", "toggle", "pause"):
-        lines.append(f"  {HOTKEY_LABELS[action]:<24} {trigger_cmd(action)}")
+    for action in HOTKEY_ORDER:
+        lines.append(f"  {HOTKEY_LABELS[action]:<46} {trigger_cmd(action)}")
     return "\n".join(lines)
+
+
+#session output files
+#every launch gets its own file, named from the configured output path + a timestamp.
+
+class OutputError(Exception):
+    pass
+
+
+SESSION_STAMP_FORMAT = "%Y-%m-%d_%H-%M-%S"
+
+
+class SessionOutput:
+    """One output file per application launch.
+
+    The file name is derived from the configured output path (``ocr_output.txt`` becomes
+    ``ocr_output_2026-01-31_14-05-09.txt``) and is reserved with exclusive creation, so an existing
+    file, from an earlier launch or anything else, is never opened for writing. The path is fixed for
+    the whole launch; changing the setting only affects the next launch.
+    """
+
+    def __init__(self, configured_path: str, clock=datetime.now):
+        self.base = Path(os.path.expanduser(str(configured_path or "")))
+        self._configured = str(configured_path or "")
+        self.started = clock()
+        self._path = None
+        self._lock = threading.Lock()
+
+    @property
+    def path(self):
+        """The active session file, or None if it has not been created yet."""
+        return self._path
+
+    def _parts(self):
+        is_dir = self.base.is_dir() or self._configured.endswith(("/", "\\"))
+        if is_dir or not self._configured.strip():
+            folder = self.base if self._configured.strip() else Path.home()
+            return folder, "ocr_output", ".txt"
+        return self.base.parent, (self.base.stem or "ocr_output"), self.base.suffix
+
+    def ensure(self) -> Path:
+        with self._lock:
+            if self._path is not None:
+                return self._path
+            folder, stem, suffix = self._parts()
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise OutputError(f"Cannot create the output folder {folder}: {exc.strerror or exc}") from exc
+            stamp = self.started.strftime(SESSION_STAMP_FORMAT)
+            for n in range(1, 1000):
+                extra = "" if n == 1 else f"_{n}"
+                candidate = folder / f"{stem}_{stamp}{extra}{suffix}"
+                try:
+                    with open(candidate, "x", encoding="utf-8"):
+                        pass
+                except FileExistsError:
+                    continue
+                except OSError as exc:
+                    raise OutputError(f"Cannot create the output file {candidate}: {exc.strerror or exc}") from exc
+                self._path = candidate
+                log.info("Session output file: %s", candidate)
+                return candidate
+            raise OutputError(f"Could not find a free session file name in {folder}.")
 
 
 #capture screen shit
@@ -467,12 +542,82 @@ class CaptureError(Exception):
     pass
 
 
+GEOM_RE = re.compile(r"(-?\d+),(-?\d+) (\d+)x(\d+)")
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def monitor_layout(monitors) -> list:
+    """Order independent fingerprint of the physical monitor layout."""
+    return sorted([int(m["left"]), int(m["top"]), int(m["width"]), int(m["height"])] for m in monitors)
+
+
+def region_problem(region, wayland: bool, monitors=None):
+    """None if the stored region is usable, otherwise a human readable reason.
+
+    `monitors` is the current list of physical monitors (dicts with left/top/width/height). When given,
+    the region must still lie on the desktop and the layout must match the one it was selected on.
+    """
+    if region is None:
+        return "No region is stored yet. Select a region first."
+    if not isinstance(region, dict):
+        return "The stored region is not valid. Select a new region."
+    kind = region.get("type")
+    if kind == "geom":
+        if not wayland:
+            return "The stored region was selected on Wayland and cannot be used here. Select a new region."
+        m = GEOM_RE.fullmatch(str(region.get("geom", "")))
+        if not m:
+            return "The stored region is malformed. Select a new region."
+        if int(m.group(3)) <= 0 or int(m.group(4)) <= 0:
+            return "The stored region is empty (zero size). Select a new region."
+        return None
+    if kind == "mss":
+        if wayland:
+            return "The stored region was not selected on Wayland and cannot be used here. Select a new region."
+        vals = [region.get(k) for k in ("left", "top", "width", "height")]
+        if not all(_is_int(v) for v in vals):
+            return "The stored region is malformed. Select a new region."
+        left, top, width, height = vals
+        if width <= 0 or height <= 0:
+            return f"The stored region has no area ({width}\u00d7{height}). Select a new region."
+        if monitors:
+            bl = min(m["left"] for m in monitors)
+            bt = min(m["top"] for m in monitors)
+            br = max(m["left"] + m["width"] for m in monitors)
+            bb = max(m["top"] + m["height"] for m in monitors)
+            if left < bl or top < bt or left + width > br or top + height > bb:
+                return "The stored region is no longer on the screen (monitors changed). Select a new region."
+            stored = region.get("layout")
+            if stored is not None and stored != monitor_layout(monitors):
+                return "The monitor layout changed since this region was selected. Select the region again."
+        return None
+    return "The stored region has an unknown type. Select a new region."
+
+
+def _mss_module():
+    """(mss module, tuple of its capture error types)."""
+    try:
+        import mss
+    except ImportError:
+        raise CaptureError("The 'mss' package is missing: pip install mss") from None
+    try:
+        from mss.exception import ScreenShotError
+        return mss, (ScreenShotError, OSError, ValueError)
+    except ImportError:
+        return mss, (OSError, ValueError)
+
+
 class Capturer:
     """Wayland (Hyprland, sway, ...) uses grim + slurp. Everything else uses mss + a Qt selector."""
 
     def __init__(self):
         self.wayland = is_wayland()
         self.hypr = is_hyprland()
+        self._slurp = None
+        self._slurp_lock = threading.Lock()
 
     @property
     def backend(self) -> str:
@@ -487,44 +632,55 @@ class Capturer:
             return None
         try:
             import mss  # noqa: F401
-        except Exception:
+        except ImportError:
             return "The 'mss' package is missing: pip install mss"
         return None
 
-    def region_ok(self, region) -> bool:
-        if not isinstance(region, dict):
-            return False
-        if region.get("type") == "geom":
-            return self.wayland and bool(re.fullmatch(r"-?\d+,-?\d+ \d+x\d+", str(region.get("geom", ""))))
-        if region.get("type") == "mss":
-            return (not self.wayland) and all(isinstance(region.get(k), int) for k in ("left", "top", "width", "height"))
-        return False
+    def physical_monitors(self) -> list:
+        """Physical monitors as mss sees them (index 0, the virtual desktop, excluded)."""
+        mss, errors = _mss_module()
+        try:
+            with mss.mss() as sct:
+                return [dict(m) for m in sct.monitors[1:]]
+        except errors as exc:
+            raise CaptureError(f"Could not read the monitor layout: {exc}") from exc
 
-    # monitors 
+    def region_error(self, region):
+        """None if `region` can be captured right now, else the reason."""
+        if self.wayland:
+            return region_problem(region, True)
+        try:
+            monitors = self.physical_monitors()
+        except CaptureError as exc:
+            return str(exc)
+        return region_problem(region, False, monitors)
+
+    def region_ok(self, region) -> bool:
+        return self.region_error(region) is None
+
+    # monitors
     def _hypr_monitors(self) -> list:
-        r = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=5)
-        data = json.loads(r.stdout or "[]")
+        try:
+            r = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=5)
+            data = json.loads(r.stdout or "[]")
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise CaptureError(f"hyprctl failed: {exc}") from exc
         return [m for m in data if isinstance(m, dict) and m.get("name")]
 
     def list_monitors(self) -> list:
         items = [("Primary / focused monitor", "auto"), ("All monitors", "all")]
-        try:
-            if self.wayland:
-                if self.hypr and shutil.which("hyprctl"):
-                    for m in self._hypr_monitors():
-                        items.append((f"{m['name']} ({m.get('width', '?')}x{m.get('height', '?')})", m["name"]))
-            else:
-                import mss
-                with mss.mss() as sct:
-                    for i, m in enumerate(sct.monitors[1:], 1):
-                        items.append((f"Monitor {i} ({m['width']}x{m['height']})", str(i)))
-        except Exception:
-            pass
+        if self.wayland:
+            if self.hypr and shutil.which("hyprctl"):
+                for m in self._hypr_monitors():
+                    items.append((f"{m['name']} ({m.get('width', '?')}x{m.get('height', '?')})", m["name"]))
+        else:
+            for i, m in enumerate(self.physical_monitors(), 1):
+                items.append((f"Monitor {i} ({m['width']}x{m['height']})", str(i)))
         return items
 
     # grabbing
     #エッチなのはダメ！
-    
+
     @staticmethod
     def _to_pil(shot):
         return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
@@ -534,9 +690,9 @@ class Capturer:
         try:
             r = subprocess.run(["grim", *args, "-"], capture_output=True, timeout=20)
         except FileNotFoundError:
-            raise CaptureError("grim is not installed (Arch: sudo pacman -S grim slurp).")
+            raise CaptureError("grim is not installed (Arch: sudo pacman -S grim slurp).") from None
         except subprocess.TimeoutExpired:
-            raise CaptureError("grim timed out.")
+            raise CaptureError("grim timed out.") from None
         if r.returncode != 0 or not r.stdout:
             msg = (r.stderr or b"").decode("utf-8", "ignore").strip()
             raise CaptureError(f"grim failed: {msg[:200] or 'no output'}")
@@ -545,45 +701,74 @@ class Capturer:
         return img.convert("RGB")
 
     def grab_full(self, key: str):
+        """Full-screen mode: the configured monitor, or every monitor for "all"."""
         if self.wayland:
             args = []
             out = None
             if key == "auto" and self.hypr and shutil.which("hyprctl"):
-                try:
-                    for m in self._hypr_monitors():
-                        if m.get("focused"):
-                            out = m["name"]
-                except Exception:
-                    out = None
+                for m in self._hypr_monitors():
+                    if m.get("focused"):
+                        out = m["name"]
             elif key not in ("auto", "all"):
                 out = key
             if out:
                 args += ["-o", out]
             return self._grim(args)
-        import mss
-        with mss.mss() as sct:
-            idx = 0 if key == "all" else (1 if key == "auto" else int(key))
-            if idx >= len(sct.monitors):
-                idx = 1 if len(sct.monitors) > 1 else 0
-            return self._to_pil(sct.grab(sct.monitors[idx]))
+        mss, errors = _mss_module()
+        try:
+            with mss.mss() as sct:
+                if key == "all":
+                    mon = sct.monitors[0]
+                else:
+                    idx = 1 if key == "auto" else int(key)
+                    if not 1 <= idx < len(sct.monitors):
+                        raise CaptureError(f"Monitor {key} is not connected. Choose another one on the Capture page.")
+                    mon = sct.monitors[idx]
+                shot = sct.grab(mon)
+        except ValueError:
+            raise CaptureError(f"Invalid monitor setting: {key!r}.") from None
+        except errors as exc:
+            raise CaptureError(f"Screen capture failed: {exc}") from exc
+        return self._to_pil(shot)
 
     def grab_region(self, region):
-        if not self.region_ok(region):
-            raise CaptureError("No valid region. Select a region first.")
+        """Region mode: only the stored region. Never falls back to full screen."""
+        err = self.region_error(region)
+        if err:
+            raise CaptureError(err)
         if region["type"] == "geom":
             return self._grim(["-g", region["geom"]])
-        import mss
+        mss, errors = _mss_module()
         box = {k: int(region[k]) for k in ("left", "top", "width", "height")}
-        with mss.mss() as sct:
-            return self._to_pil(sct.grab(box))
+        try:
+            with mss.mss() as sct:
+                img = self._to_pil(sct.grab(box))
+        except errors as exc:
+            raise CaptureError(f"Screen capture failed: {exc}") from exc
+        if not IS_MAC and img.size != (box["width"], box["height"]):  # macOS Retina returns 2x pixels
+            raise CaptureError(f"Captured {img.size[0]}\u00d7{img.size[1]} px instead of "
+                               f"{box['width']}\u00d7{box['height']} px. Select the region again.")
+        return img
 
     def grab_all_monitors(self) -> list:
-        import mss
+        mss, errors = _mss_module()
         shots = []
-        with mss.mss() as sct:
-            for m in sct.monitors[1:]:
-                shots.append((dict(m), self._to_pil(sct.grab(m))))
+        try:
+            with mss.mss() as sct:
+                for m in sct.monitors[1:]:
+                    shots.append((dict(m), self._to_pil(sct.grab(m))))
+        except errors as exc:
+            raise CaptureError(f"Screen capture failed: {exc}") from exc
+        if not shots:
+            raise CaptureError("No monitors were found to capture.")
         return shots
+
+    def cancel_selection(self):
+        """Stop a running slurp (used when the app quits mid selection)."""
+        with self._slurp_lock:
+            proc = self._slurp
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
 
     def select_region_wayland(self):
         """Blocking. Returns a region dict, or None if the user cancelled."""
@@ -591,30 +776,41 @@ class Capturer:
         last_err = ""
         for cmd in (styled, ["slurp"]):
             try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             except FileNotFoundError:
-                raise CaptureError("slurp is not installed (Arch: sudo pacman -S grim slurp).")
+                raise CaptureError("slurp is not installed (Arch: sudo pacman -S grim slurp).") from None
+            with self._slurp_lock:
+                self._slurp = proc
+            try:
+                out, err = proc.communicate(timeout=300)
             except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
                 return None
-            geom = (r.stdout or "").strip()
-            if r.returncode != 0 or not geom:
-                err = (r.stderr or "").strip()
-                if not err or "cancel" in err.lower():
+            finally:
+                with self._slurp_lock:
+                    self._slurp = None
+            geom = (out or "").strip()
+            if proc.returncode != 0 or not geom:
+                err = (err or "").strip()
+                if not err or "cancel" in err.lower() or proc.returncode in (-15, -9):
                     return None
                 last_err = err
                 continue
-            m = re.fullmatch(r"(-?\d+),(-?\d+) (\d+)x(\d+)", geom)
-            if not m or int(m.group(3)) < 4 or int(m.group(4)) < 4:
-                return None
+            m = GEOM_RE.fullmatch(geom)
+            if not m:
+                raise CaptureError(f"slurp returned an unexpected selection: {geom[:60]!r}")
+            if int(m.group(3)) < MIN_SELECTION_PX or int(m.group(4)) < MIN_SELECTION_PX:
+                raise CaptureError(f"The selection was too small (minimum {MIN_SELECTION_PX}\u00d7{MIN_SELECTION_PX} px).")
             return {"type": "geom", "geom": geom}
         raise CaptureError(f"slurp failed: {last_err[:200]}")
 
 
 def describe_region(r) -> str:
-    if not r:
+    if not r or not isinstance(r, dict):
         return "No region selected"
     if r.get("type") == "geom":
-        m = re.fullmatch(r"(-?\d+),(-?\d+) (\d+)x(\d+)", str(r.get("geom", "")))
+        m = GEOM_RE.fullmatch(str(r.get("geom", "")))
         if m:
             return f"{m.group(3)}\u00d7{m.group(4)} px at ({m.group(1)}, {m.group(2)})"
         return str(r.get("geom"))
@@ -624,26 +820,55 @@ def describe_region(r) -> str:
         return "No region selected"
 
 
-def match_screens(screens, monitors) -> list:
-    """Pair Qt screens with mss monitors. Returns [(QScreen, monitor_index)]."""
-    pairs, used = [], set()
-    for qs in screens:
-        g, dpr = qs.geometry(), qs.devicePixelRatio()
-        best = None
+def match_screens(screens, monitors) -> dict:
+    """Pair Qt screens with mss monitors.
+
+    screens: [(x, y, width, height, device_pixel_ratio)] in Qt coordinates; monitors: mss monitor dicts
+    in physical pixels. Returns {screen_index: monitor_index} for confident matches only. Qt reports a
+    screen's size in device independent pixels, and (depending on version) its position either native or
+    scaled, so both readings are tried. Negative coordinates are fine. Best global score wins first, so
+    identical monitors are told apart by position.
+    """
+    cands = []
+    for si, (x, y, w, h, dpr) in enumerate(screens):
         for mi, m in enumerate(monitors):
-            if mi in used:
-                continue
-            size = min(abs(m["width"] - g.width() * dpr) + abs(m["height"] - g.height() * dpr),
-                       abs(m["width"] - g.width()) + abs(m["height"] - g.height()))
-            pos = min(abs(m["left"] - g.x() * dpr) + abs(m["top"] - g.y() * dpr),
-                      abs(m["left"] - g.x()) + abs(m["top"] - g.y()))
-            score = size * 10 + pos
-            if best is None or score < best[0]:
-                best = (score, mi)
-        if best:
-            used.add(best[1])
-            pairs.append((qs, best[1]))
-    return pairs
+            size = min(abs(m["width"] - w * dpr) + abs(m["height"] - h * dpr),
+                       abs(m["width"] - w) + abs(m["height"] - h))
+            pos = min(abs(m["left"] - x * dpr) + abs(m["top"] - y * dpr),
+                      abs(m["left"] - x) + abs(m["top"] - y))
+            if size <= max(8.0, 0.01 * (m["width"] + m["height"])):
+                cands.append((size * 10 + pos, si, mi))
+    cands.sort()
+    out, used = {}, set()
+    for _score, si, mi in cands:
+        if si in out or mi in used:
+            continue
+        out[si] = mi
+        used.add(mi)
+    return out
+
+
+def map_selection(mon: dict, sel, widget_size):
+    """Map a rectangle dragged on a screen overlay to screenshot coordinates.
+
+    sel = (x, y, w, h) and widget_size = (w, h), both in Qt logical pixels; mon is the physical mss
+    monitor. The ratio monitor / widget size absorbs Windows display scaling and any device pixel
+    ratio. Edges are rounded, not sizes, so the crop and the stored region always agree. Returns
+    (region dict, crop box in image pixels). Raises ValueError if nothing is left after clamping.
+    """
+    ww, wh = widget_size
+    if ww <= 0 or wh <= 0:
+        raise ValueError("overlay has no size")
+    mw, mh = int(mon["width"]), int(mon["height"])
+    fx, fy = mw / ww, mh / wh
+    x, y, w, h = sel
+    x0, x1 = max(0, round(x * fx)), min(mw, round((x + w) * fx))
+    y0, y1 = max(0, round(y * fy)), min(mh, round((y + h) * fy))
+    if x1 - x0 < 1 or y1 - y0 < 1:
+        raise ValueError("empty selection")
+    region = {"type": "mss", "left": int(mon["left"]) + x0, "top": int(mon["top"]) + y0,
+              "width": x1 - x0, "height": y1 - y0}
+    return region, (x0, y0, x1, y1)
 
 
 class RegionOverlay(QWidget):
@@ -656,6 +881,7 @@ class RegionOverlay(QWidget):
                          | Qt.WindowType.WindowStaysOnTopHint)
         self.shot_index = shot_index
         self.target_screen = screen
+        self.dismissed = False  # set by the manager before it closes us on purpose
         self.setScreen(screen)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setMouseTracking(True)
@@ -724,8 +950,8 @@ class RegionOverlay(QWidget):
         self.cur = e.position().toPoint()
         r = self.sel_rect()
         self.start = None
-        if r is None or r.width() < 8 or r.height() < 8:
-            self.cur = None
+        if r is None or r.width() < MIN_SELECTION_PX or r.height() < MIN_SELECTION_PX:
+            self.cur = None  # too small: ignore it and let the user drag again
             self.update()
             return
         self.picked.emit(self.shot_index, r, self.size())
@@ -734,56 +960,73 @@ class RegionOverlay(QWidget):
         if e.key() == Qt.Key.Key_Escape:
             self.cancelled.emit()
 
+    def closeEvent(self, event):
+        if not self.dismissed:  # closed by the window manager (Alt+F4 ...): that is a cancel
+            self.dismissed = True
+            self.cancelled.emit()
+        event.accept()
+
 
 class OverlayManager(QObject):
-    finished = Signal(object)  # None, or (region dict, PIL image)
+    finished = Signal(object, str)  # (region dict, PIL image) or None, and an error text ("" if none)
 
     def __init__(self, shots: list, screens: list):
         super().__init__()
         self.shots = shots
+        self.layout = monitor_layout([m for m, _ in shots])
         self.overlays = []
+        self.unmatched = []
         self._done = False
-        for qs, si in match_screens(screens, [m for m, _ in shots]):
-            ov = RegionOverlay(si, qs, shots[si][1])
+        geoms = []
+        for qs in screens:
+            g = qs.geometry()
+            geoms.append((g.x(), g.y(), g.width(), g.height(), qs.devicePixelRatio()))
+        mapping = match_screens(geoms, [m for m, _ in shots])
+        self.unmatched = [i for i in range(len(screens)) if i not in mapping]
+        for si, mi in mapping.items():
+            ov = RegionOverlay(mi, screens[si], shots[mi][1])
             ov.picked.connect(self._picked)
-            ov.cancelled.connect(lambda: self._finish(None))
+            ov.cancelled.connect(lambda: self._finish(None, ""))
             self.overlays.append(ov)
 
     def start(self):
         if not self.overlays:
-            self._finish(None)
+            self._finish(None, "None of the screens could be matched to a capture monitor.")
             return
         for ov in self.overlays:
             ov.launch()
 
     def _picked(self, si: int, rect: QRect, wsize: QSize):
         mon, img = self.shots[si]
-        fx, fy = img.width / max(1, wsize.width()), img.height / max(1, wsize.height())
-        box = (max(0, round(rect.x() * fx)), max(0, round(rect.y() * fy)),
-               min(img.width, round((rect.x() + rect.width()) * fx)),
-               min(img.height, round((rect.y() + rect.height()) * fy)))
-        crop = img.crop(box)
-        mx, my = mon["width"] / max(1, wsize.width()), mon["height"] / max(1, wsize.height())
-        region = {
-            "type": "mss",
-            "left": int(mon["left"] + round(rect.x() * mx)),
-            "top": int(mon["top"] + round(rect.y() * my)),
-            "width": max(1, int(round(rect.width() * mx))),
-            "height": max(1, int(round(rect.height() * my))),
-        }
-        self._finish((region, crop))
+        try:
+            region, crop_box = map_selection(mon, (rect.x(), rect.y(), rect.width(), rect.height()),
+                                             (wsize.width(), wsize.height()))
+        except ValueError as exc:
+            self._finish(None, f"Invalid selection ({exc}).")
+            return
+        region["layout"] = self.layout  # lets us detect a changed monitor setup later
+        self._finish((region, img.crop(crop_box)), "")
 
-    def _finish(self, payload):
+    def _close_overlays(self):
+        for ov in self.overlays:
+            ov.dismissed = True
+            ov.close()
+            ov.deleteLater()
+        self.overlays = []
+
+    def cancel(self):
+        """Synchronous teardown for application shutdown. No signal is emitted."""
+        self._done = True
+        self._close_overlays()
+
+    def _finish(self, payload, err: str):
         if self._done:
             return
         self._done = True
 
         def close_all():
-            for ov in self.overlays:
-                ov.close()
-                ov.deleteLater()
-            self.overlays = []
-            self.finished.emit(payload)
+            self._close_overlays()
+            self.finished.emit(payload, err)
 
         QTimer.singleShot(0, close_all)
 
@@ -1247,16 +1490,14 @@ class OCRClient:
 
 
 class TextSink:
-    def __init__(self, get_cfg):
+    """Appends text to the session output file. Duplicate filtering lasts for the whole launch."""
+
+    def __init__(self, get_cfg, session: SessionOutput):
         self.get_cfg = get_cfg
+        self.session = session
         self._lock = threading.Lock()
         self._last = ""
         self._seen = set()
-
-    def reset_session(self):
-        with self._lock:
-            self._seen.clear()
-            self._last = ""
 
     def write(self, text: str, force: bool = False) -> int:
         cfg = self.get_cfg()
@@ -1267,23 +1508,29 @@ class TextSink:
         with self._lock:
             if not force and cfg["skip_duplicates"] and norm == self._last:
                 return 0
-            self._last = norm
+            fresh = lines
+            seen_add = []
             if not force and cfg["only_new_lines"]:
                 fresh = []
                 for ln in lines:
                     k = " ".join(ln.split())
-                    if k not in self._seen:
-                        self._seen.add(k)
+                    if k not in self._seen and k not in seen_add:
+                        seen_add.append(k)
                         fresh.append(ln)
-                lines = fresh
-                if not lines:
+                if not fresh:
+                    self._last = norm
                     return 0
-            path = Path(os.path.expanduser(cfg["output_file"]))
-            path.parent.mkdir(parents=True, exist_ok=True)
+            path = self.session.ensure()
             stamp = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] " if cfg["timestamps"] else ""
-            with open(path, "a", encoding="utf-8", newline="\n") as fh:
-                fh.write("".join(f"{stamp}{ln}\n" for ln in lines))
-            return len(lines)
+            try:
+                with open(path, "a", encoding="utf-8", newline="\n") as fh:
+                    fh.write("".join(f"{stamp}{ln}\n" for ln in fresh))
+            except OSError as exc:
+                raise OutputError(f"Could not write to {path}: {exc.strerror or exc}") from exc
+            # state only advances once the text is really on disk
+            self._last = norm
+            self._seen.update(seen_add)
+            return len(fresh)
 
 
 def frame_signature(img):
@@ -1297,50 +1544,137 @@ def frame_changed(a, b, threshold: float = 0.00005) -> bool:
     return ImageStat.Stat(diff).mean[0] / 255.0 > threshold
 
 
+class ScanService:
+    """Qt-free scan pipeline shared by recording, region scans and scan-current.
+
+    capture() routes by mode and never falls back from region to full screen: a bad region is an error.
+    """
+
+    def __init__(self, get_cfg, capturer: Capturer, ocr: OCRClient, sink: TextSink):
+        self.get_cfg = get_cfg
+        self.capturer = capturer
+        self.ocr = ocr
+        self.sink = sink
+
+    def capture(self, mode: str, region, monitor: str):
+        if mode == "region":
+            return self.capturer.grab_region(region)
+        if mode == "full":
+            return self.capturer.grab_full(monitor)
+        raise CaptureError(f"Unknown capture mode: {mode!r}")
+
+    def process_image(self, img, force: bool = False):
+        text, provider = self.ocr.recognize(img, self.get_cfg()["max_side"])
+        written = self.sink.write(text, force=force) if text else 0
+        return text, written, provider
+
+    def scan_current(self, mode: str, region, monitor: str):
+        """Capture what is configured right now and run it through OCR + output (duplicate filter on)."""
+        img = self.capture(mode, region, monitor)
+        return self.process_image(img, force=False)
+
+
 # hotkeys
-# again, these do not work
 
 class HotkeyManager:
-    def __init__(self, emit):
+    """Global hotkeys through pynput (X11, Windows, macOS). Callbacks only call `emit`, which must hand
+    the command to the GUI thread (a Qt signal); they never touch widgets themselves."""
+
+    def __init__(self, emit, backend=None):
         self.emit = emit
-        self.listener = None
+        self._backend = backend  # tests inject a fake with GlobalHotKeys(mapping)
+        self._listener = None
+        self._generation = 0
+        self._lock = threading.Lock()
+
+    @property
+    def running(self) -> bool:
+        return self._listener is not None
 
     def stop(self):
-        if self.listener is not None:
-            try:
-                self.listener.stop()
-            except Exception:
-                pass
-            self.listener = None
+        with self._lock:
+            listener, self._listener = self._listener, None
+            self._generation += 1  # callbacks of the old listener become no-ops
+        if listener is None:
+            return
+        try:
+            listener.stop()
+            if threading.current_thread() is not listener:
+                listener.join(1.0)
+        except Exception:  # cleanup boundary: never let a backend error break shutdown, but record it
+            log.exception("Could not stop the hotkey listener cleanly")
+
+    def _make_callback(self, action: str, generation: int):
+        def callback():
+            if self._generation == generation:
+                self.emit(action)
+        return callback
 
     def apply(self, hotkeys: dict):
+        """Register hotkeys. Returns (ok, message, level) with level in ok/info/warn/err."""
         self.stop()
         if is_wayland():
             return False, ("Wayland: apps can't grab global keys. Bind the keys in your compositor "
-                           "using the lines below (they call --trigger).")
-        try:
-            from pynput import keyboard
-        except Exception:
-            return False, "Global hotkeys need the 'pynput' package:  pip install pynput"
-        mapping = {}
-        for cmd, seq in hotkeys.items():
+                           "using the lines below (they call --trigger)."), "info"
+        mapping, owner, problems = {}, {}, []
+        with self._lock:
+            generation = self._generation
+        for action in HOTKEY_ORDER:
+            seq = hotkeys.get(action)
             if not seq:
                 continue
+            label = HOTKEY_LABELS[action]
             pk = to_pynput(seq)
             if not pk:
-                return False, f"Unsupported hotkey: {seq}"
-            mapping[pk] = (lambda c=cmd: self.emit(c))
+                problems.append(f"'{label}': unsupported hotkey {seq}")
+                continue
+            if pk in owner:
+                problems.append(f"{seq} is assigned to both '{HOTKEY_LABELS[owner[pk]]}' and '{label}'; "
+                                f"'{label}' was not registered")
+                continue
+            owner[pk] = action
+            mapping[pk] = self._make_callback(action, generation)
         if not mapping:
-            return True, "No hotkeys set."
+            if problems:
+                return False, "No hotkeys registered. " + "; ".join(problems) + ".", "err"
+            return True, "No hotkeys set.", "info"
+        backend = self._backend
+        if backend is None:
+            try:
+                from pynput import keyboard as backend
+            except ImportError as exc:
+                if getattr(exc, "name", None) in ("pynput", "pynput.keyboard"):
+                    return False, "Global hotkeys need the 'pynput' package:  pip install pynput", "err"
+                log.error("pynput could not be loaded: %s", exc)
+                return False, f"Global hotkeys are unavailable: pynput could not start ({exc}).", "err"
         try:
-            self.listener = keyboard.GlobalHotKeys(mapping)
-            self.listener.daemon = True
-            self.listener.start()
-        except Exception as exc:
-            return False, f"Could not register hotkeys: {exc}"
+            listener = backend.GlobalHotKeys(mapping)
+            listener.daemon = True
+            listener.start()
+        except Exception as exc:  # backend raises platform specific errors; report them, with traceback in the log
+            log.exception("Could not register global hotkeys")
+            return False, f"Could not register hotkeys: {exc}", "err"
+        with self._lock:
+            self._listener = listener
+        if problems:
+            return False, f"Registered {len(mapping)} hotkey(s), but: " + "; ".join(problems) + ".", "err"
         note = " On macOS, allow Accessibility / Input Monitoring for this app if keys do nothing." if IS_MAC else ""
-        return True, "Global hotkeys active." + note
+        return True, "Global hotkeys active." + note, "ok"
 
+    def check_alive(self):
+        """pynput reports startup failures from inside its thread. Returns an error text if the listener died."""
+        listener = self._listener
+        if listener is None or listener.is_alive():
+            return None
+        with self._lock:
+            self._listener = None
+        try:
+            listener.join(0.1)  # re-raises the exception that killed the thread, if any
+            reason = "the listener stopped unexpectedly"
+        except Exception as exc:  # the stored listener exception can be of any type
+            reason = str(exc) or exc.__class__.__name__
+        log.error("Hotkey listener died: %s", reason)
+        return f"Global hotkeys stopped working: {reason}"
 
 
 class Bus(QObject):
@@ -1348,18 +1682,43 @@ class Bus(QObject):
     result = Signal(str, int, str, str)   # text, lines saved, provider, source
     command = Signal(str)
     select_done = Signal(object)          # (region, image, error)
+    shots_ready = Signal(object)          # screenshots for the overlay selector
     models_ready = Signal(str, object, str)
     test_done = Signal(str, bool, str)
     auto_stopped = Signal(object)
     notify = Signal(str, str)
+    failure = Signal(str)                 # an error the user must see (log + notification)
+    job_done = Signal(str)                # "region" or "current": frees the busy flag on the GUI thread
+
+    def __init__(self):
+        super().__init__()
+        self._closed = threading.Event()
+
+    def close(self):
+        self._closed.set()
+
+    def post(self, name: str, *args) -> bool:
+        """Emit a signal from any thread. After close() (shutdown) emits are dropped instead of touching
+        Qt objects that may already be destroyed."""
+        if self._closed.is_set():
+            return False
+        try:
+            getattr(self, name).emit(*args)
+        except RuntimeError:
+            if self._closed.is_set():
+                return False
+            raise
+        return True
 
 
 class Recorder(threading.Thread):
     MAX_FAILS = 5
 
-    def __init__(self, win, mode: str, region):
+    def __init__(self, service: ScanService, bus: Bus, get_cfg, mode: str, region):
         super().__init__(daemon=True)
-        self.win = win
+        self.service = service
+        self.bus = bus
+        self.get_cfg = get_cfg
         self.mode = mode
         self.region = region
         self.stop_evt = threading.Event()
@@ -1380,40 +1739,40 @@ class Recorder(threading.Thread):
         self.stop_evt.set()
         self.run_evt.set()
 
-    def _grab(self):
-        cap = self.win.capturer
-        if self.mode == "region":
-            return cap.grab_region(self.region)
-        return cap.grab_full(self.win.d["monitor"])
-
     def run(self):
-        bus = self.win.bus
+        bus = self.bus
         fails = 0
         last_sig = None
         while not self.stop_evt.is_set():
             if not self.run_evt.wait(0.1):
                 continue
+            cfg = self.get_cfg()
             try:
-                img = self._grab()
+                img = self.service.capture(self.mode, self.region, cfg["monitor"])
                 sig = frame_signature(img)
-                if self.win.d["skip_unchanged"] and not frame_changed(sig, last_sig):
+                if cfg["skip_unchanged"] and not frame_changed(sig, last_sig):
                     pass
                 else:
-                    text, written, provider = self.win.process_image(img)
+                    text, written, provider = self.service.process_image(img)
                     last_sig = sig
                     if not self.stop_evt.is_set():
-                        bus.result.emit(text, written, provider, "recording")
+                        bus.post("result", text, written, provider, "recording")
                 fails = 0
-            except Exception as exc:  # keep the loop alive; report and back off
+            except (CaptureError, OCRError, OutputError) as exc:
                 fails += 1
-                bus.log.emit("err", str(exc))
-                if fails >= self.MAX_FAILS:
-                    bus.log.emit("err", f"Stopped after {self.MAX_FAILS} failures in a row. "
-                                        "Check your API key, quota and capture tools.")
-                    self.stop_evt.set()
-                    bus.auto_stopped.emit(self)
-                    return
-            wait = max(0.25, int(self.win.d["interval_ms"]) / 1000.0) + min(20, 3 * fails)
+                log.warning("Recording: %s", exc)
+                bus.post("log", "err", str(exc))
+            except Exception as exc:  # thread boundary: keep the loop alive, report and back off
+                fails += 1
+                log.exception("Recording: unexpected error")
+                bus.post("log", "err", f"Unexpected error: {exc.__class__.__name__}: {exc}")
+            if fails >= self.MAX_FAILS:
+                bus.post("log", "err", f"Stopped after {self.MAX_FAILS} failures in a row. "
+                                       "Check your API key, quota and capture tools.")
+                self.stop_evt.set()
+                bus.post("auto_stopped", self)
+                return
+            wait = max(0.25, int(cfg["interval_ms"]) / 1000.0) + min(20, 3 * fails)
             self.stop_evt.wait(wait)
 
 
@@ -1748,28 +2107,34 @@ class ProviderCard(QFrame):
 # MAIN WINDOW
 
 class MainWindow(QMainWindow):
-    def __init__(self, cfg: Config, bus: Bus, capturer: Capturer, ocr: OCRClient, sink: TextSink, ipc_ok: bool):
+    def __init__(self, cfg: Config, bus: Bus, service: ScanService, session: SessionOutput, ipc_ok: bool,
+                 startup_error: str = ""):
         super().__init__()
         self.cfg, self.d, self.bus = cfg, cfg.data, bus
-        self.capturer, self.ocr, self.sink, self.ipc_ok = capturer, ocr, sink, ipc_ok
+        self.service, self.session, self.ipc_ok = service, session, ipc_ok
+        self.capturer, self.ocr, self.sink = service.capturer, service.ocr, service.sink
+        self._startup_error = startup_error
+        self._closing = False
+        self._restore_state = None
+        self._scan_busy = False
         self.rec = None
         self.state = "idle"
         self.captures = 0
         self.lines_total = 0
         self._selecting = False
         self._select_cb = None
-        self._restore_after = False
         self._overlay = None
         self._oneshot_busy = False
         self._really_quit = False
         self.cards = {}
         self.tray = None
         self.ipc = None
-        self.hotkeys = HotkeyManager(lambda c: self.bus.command.emit(c))
+        # listener threads only ever post a command; the GUI thread does the work
+        self.hotkeys = HotkeyManager(lambda c: self.bus.post("command", c))
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(300)
-        self._save_timer.timeout.connect(self.cfg.save)
+        self._save_timer.timeout.connect(self._flush_config)
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(make_app_icon())
@@ -1782,6 +2147,9 @@ class MainWindow(QMainWindow):
         bus.result.connect(self.on_result)
         bus.command.connect(self.on_command)
         bus.select_done.connect(self._on_select_done)
+        bus.shots_ready.connect(self._on_shots_ready)
+        bus.failure.connect(self._report_error)
+        bus.job_done.connect(self._on_job_done)
         bus.models_ready.connect(self._on_models_ready)
         bus.test_done.connect(self._on_test_done)
         bus.auto_stopped.connect(self._on_auto_stopped)
@@ -1797,6 +2165,16 @@ class MainWindow(QMainWindow):
     def save_soon(self):
         self._save_timer.start()
 
+    def _flush_config(self):
+        err = self.cfg.save()
+        if err:
+            self._report_error(err)
+
+    def _report_error(self, msg: str):
+        """Errors the user has to see: activity log plus a notification even if the window is hidden."""
+        self.add_log("err", msg)
+        self.notify(APP_NAME, msg, force=True)
+
     def set_cfg(self, key, value):
         self.d[key] = value
         self.save_soon()
@@ -1806,13 +2184,14 @@ class MainWindow(QMainWindow):
             webbrowser.open(url)
 
     def add_log(self, level: str, msg: str):
+        log.log({"err": logging.ERROR, "warn": logging.WARNING}.get(level, logging.INFO), "%s", msg)
         color = {"info": "#9a9aa2", "ok": "#7ee2a8", "warn": "#f5b942", "err": "#ff6b70"}.get(level, "#9a9aa2")
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_view.appendHtml(
             f'<span style="color:#5f5f67">{stamp}</span>&nbsp;&nbsp;<span style="color:{color}">{html.escape(msg)}</span>')
 
-    def notify(self, title: str, body: str):
-        if not self.d["notifications"]:
+    def notify(self, title: str, body: str, force: bool = False):
+        if not force and not self.d["notifications"]:
             return
         if IS_LINUX and shutil.which("notify-send"):
             try:
@@ -1839,6 +2218,14 @@ class MainWindow(QMainWindow):
             self.warm_local()
         if not self.ipc_ok:
             self.add_log("warn", "Could not open the command channel; --trigger hotkeys will not work.")
+        if self._startup_error:
+            self._report_error(f"Output file: {self._startup_error}")
+        elif self.session.path is not None:
+            self.add_log("info", f"This session writes to {self.session.path}")
+        if self.d["mode"] == "region" and self.d["region"] is not None:
+            err = self.capturer.region_error(self.d["region"])
+            if err:
+                self.add_log("warn", err)
 
     # ui
     def _build_ui(self):
@@ -1936,9 +2323,9 @@ class MainWindow(QMainWindow):
         self.btn_select_region = QPushButton("Select region")
         self.btn_select_region.clicked.connect(self.pick_region_clicked)
         self.region_label = QLabel("")
+        self.region_label.setWordWrap(True)
         rr.addWidget(self.btn_select_region)
-        rr.addWidget(self.region_label)
-        rr.addStretch(1)
+        rr.addWidget(self.region_label, 1)
         cl.addWidget(self.region_row)
 
         self.btn_start = QPushButton("Start")
@@ -1958,11 +2345,17 @@ class MainWindow(QMainWindow):
         cl.addLayout(h_row(self.status_dot, self.status_text, 16, self.stats_label, stretch_end=True))
         lay.addWidget(card)
 
-        card2, c2 = make_card("Quick scan", "Press the hotkey, drag a region, and it is read once. Do it again for each scan.")
-        self.btn_oneshot = QPushButton("Scan region once")
+        card2, c2 = make_card("Quick scan", "One-off scans that work with or without recording.")
+        self.btn_oneshot = QPushButton("Select new region and scan")
+        self.btn_oneshot.setToolTip("Opens the region selector and reads the area you drag. The region is not stored.")
         self.btn_oneshot.clicked.connect(self.one_shot)
         self.hotkey_hint = muted("")
         c2.addLayout(h_row(self.btn_oneshot, self.hotkey_hint, stretch_end=True))
+        self.btn_current = QPushButton("Scan current")
+        self.btn_current.setToolTip("Region mode: reads the stored region, no selector. Full-screen mode: reads the configured monitor.")
+        self.btn_current.clicked.connect(self.scan_current)
+        self.hotkey_hint_current = muted("")
+        c2.addLayout(h_row(self.btn_current, self.hotkey_hint_current, stretch_end=True))
         lay.addWidget(card2)
 
         card3, c3 = make_card("Activity")
@@ -2025,9 +2418,9 @@ class MainWindow(QMainWindow):
         def work():
             try:
                 ms = self.ocr.local.warmup(self.d)
-                self.bus.log.emit("ok", f"Local OCR engine ready ({ms} ms).")
+                self.bus.post("log", "ok", f"Local OCR engine ready ({ms} ms).")
             except Exception as exc:
-                self.bus.log.emit("err", f"Local OCR: {exc}")
+                self.bus.post("log", "err", f"Local OCR: {exc}")
         threading.Thread(target=work, daemon=True).start()
 
     # -- settings page
@@ -2047,7 +2440,14 @@ class MainWindow(QMainWindow):
         lay.addWidget(s)
 
         # output
-        card, cl = make_card("Output file", "Text is appended to this file, one line per line of text.")
+        card, cl = make_card("Output file", "Every launch writes to a NEW file named from this path plus the date and "
+                                            "time, e.g. ocr_output_2026-01-31_14-05-09.txt. Earlier files are never touched. "
+                                            "A changed path applies from the next launch.")
+        self.session_label = QLabel("")
+        self.session_label.setWordWrap(True)
+        self.session_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        cl.addWidget(self.session_label)
+        self._refresh_session_label()
         self.out_edit = QLineEdit(self.d["output_file"])
         self.out_edit.editingFinished.connect(self._output_edited)
         btn_browse = QPushButton("Browse")
@@ -2105,7 +2505,7 @@ class MainWindow(QMainWindow):
         # hotkeys
         card, cl = make_card("Hotkeys", "Click a box and press the keys you want. Clear the box to disable a hotkey.")
         self.hk_edits = {}
-        for action in ("region", "toggle", "pause"):
+        for action in HOTKEY_ORDER:
             edit = QKeySequenceEdit()
             if hasattr(edit, "setMaximumSequenceLength"):
                 edit.setMaximumSequenceLength(1)
@@ -2169,7 +2569,8 @@ class MainWindow(QMainWindow):
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         menu = QMenu()
         for text, fn in (("Show window", lambda: self.on_command("show")),
-                         ("Scan region once", self.one_shot),
+                         ("Select new region and scan", self.one_shot),
+                         ("Scan current", self.scan_current),
                          ("Start / stop recording", lambda: self.on_command("toggle")),
                          ("Quit", self.quit_app)):
             act = QAction(text, menu)
@@ -2185,13 +2586,20 @@ class MainWindow(QMainWindow):
             self.chk_tray.setEnabled(True)
 
     
+    def _refresh_session_label(self):
+        p = self.session.path
+        self.session_label.setText(f"This session: {p}" if p else "This session: (no file could be created, see the log)")
+
     def _output_edited(self):
-        self.set_cfg("output_file", self.out_edit.text().strip() or default_config()["output_file"])
+        new = self.out_edit.text().strip() or default_config()["output_file"]
+        if new != self.d["output_file"]:
+            self.add_log("info", "Output path saved. It applies from the next launch; this session keeps its file.")
+        self.set_cfg("output_file", new)
         self.out_edit.setText(self.d["output_file"])
 
     def browse_output(self):
         start = os.path.expanduser(self.d["output_file"])
-        path, _ = QFileDialog.getSaveFileName(self, "Choose the output text file", start,
+        path, _ = QFileDialog.getSaveFileName(self, "Choose the output base name", start,
                                               "Text files (*.txt);;All files (*)",
                                               options=QFileDialog.Option.DontConfirmOverwrite)
         if path:
@@ -2199,19 +2607,18 @@ class MainWindow(QMainWindow):
             self._output_edited()
 
     def open_output_file(self):
-        p = Path(os.path.expanduser(self.d["output_file"]))
-        target = p if p.exists() else p.parent
-        if not target.exists():
-            self.add_log("warn", "Nothing saved yet.")
+        p = self.session.path
+        if p is None or not p.exists():
+            self.add_log("warn", "The session output file does not exist (it could not be created).")
             return
-        self.open_url(QUrl.fromLocalFile(str(target)).toString())
+        self.open_url(QUrl.fromLocalFile(str(p)).toString())
 
     def open_output_folder(self):
-        p = Path(os.path.expanduser(self.d["output_file"])).parent
-        if p.exists():
-            self.open_url(QUrl.fromLocalFile(str(p)).toString())
-        else:
-            self.add_log("warn", "The output folder does not exist yet.")
+        p = self.session.path
+        if p is None or not p.parent.exists():
+            self.add_log("warn", "The session output folder does not exist (the file could not be created).")
+            return
+        self.open_url(QUrl.fromLocalFile(str(p.parent)).toString())
 
     def _hotkey_edited(self, action: str):
         edit = self.hk_edits[action]
@@ -2230,11 +2637,28 @@ class MainWindow(QMainWindow):
         self.refresh_snippet()
 
     def apply_hotkeys(self):
-        ok, msg = self.hotkeys.apply(self.d["hotkeys"])
-        self.hk_status.setStyleSheet(f"color: {'#7ee2a8' if ok else '#f5b942'};")
+        ok, msg, level = self.hotkeys.apply(self.d["hotkeys"])
+        self._show_hotkey_status(ok, msg, level)
+        self.hotkey_hint.setText(f"Hotkey: {self.d['hotkeys'].get('region') or '(not set)'}")
+        self.hotkey_hint_current.setText(f"Hotkey: {self.d['hotkeys'].get('current') or '(not set)'}")
+        if self.hotkeys.running:
+            QTimer.singleShot(800, self._verify_hotkeys)  # pynput reports start-up failures from its own thread
+
+    def _show_hotkey_status(self, ok: bool, msg: str, level: str):
+        color = {"ok": "#7ee2a8", "info": "#85858d", "warn": "#f5b942", "err": "#ff6b70"}[level]
+        self.hk_status.setStyleSheet(f"color: {color};")
         self.hk_status.setText(msg)
-        hk = self.d["hotkeys"].get("region") or "(not set)"
-        self.hotkey_hint.setText(f"Hotkey: {hk}")
+        if level == "err":  # never fail silently: also in the activity log and as a notification
+            self._report_error(f"Hotkeys: {msg}")
+        elif level == "info" and not ok:
+            self.add_log("info", msg)
+
+    def _verify_hotkeys(self):
+        if self._closing:
+            return
+        err = self.hotkeys.check_alive()
+        if err:
+            self._show_hotkey_status(False, err, "err")
 
     def _syntax_changed(self):
         self.set_cfg("hypr_syntax", self.syntax_combo.currentData())
@@ -2258,9 +2682,9 @@ class MainWindow(QMainWindow):
 
         def work():
             try:
-                self.bus.models_ready.emit(pdef["id"], fetch_models(pdef, snap, key), "")
+                self.bus.post("models_ready", pdef["id"], fetch_models(pdef, snap, key), "")
             except Exception as exc:
-                self.bus.models_ready.emit(pdef["id"], None, str(exc))
+                self.bus.post("models_ready", pdef["id"], None, str(exc))
         threading.Thread(target=work, daemon=True).start()
 
     def _on_models_ready(self, pid: str, models, err: str):
@@ -2285,9 +2709,9 @@ class MainWindow(QMainWindow):
             def work_local():
                 try:
                     text, ms = self.ocr.local.selftest(cfg_copy)
-                    self.bus.test_done.emit(pdef["id"], "TEST" in text.upper(), f"{text or '(nothing read)'}  [{ms} ms]")
+                    self.bus.post("test_done", pdef["id"], "TEST" in text.upper(), f"{text or '(nothing read)'}  [{ms} ms]")
                 except Exception as exc:
-                    self.bus.test_done.emit(pdef["id"], False, f"ERROR:{exc}")
+                    self.bus.post("test_done", pdef["id"], False, f"ERROR:{exc}")
             threading.Thread(target=work_local, daemon=True).start()
             return
         card.set_status("Testing with a sample image...")
@@ -2296,9 +2720,9 @@ class MainWindow(QMainWindow):
             try:
                 text = run_test(pdef, snap, key, cfg_copy)
                 ok = "TEST" in text.upper()
-                self.bus.test_done.emit(pdef["id"], ok, text or "(empty reply)")
+                self.bus.post("test_done", pdef["id"], ok, text or "(empty reply)")
             except Exception as exc:
-                self.bus.test_done.emit(pdef["id"], False, f"ERROR:{exc}")
+                self.bus.post("test_done", pdef["id"], False, f"ERROR:{exc}")
         threading.Thread(target=work, daemon=True).start()
 
     def _on_test_done(self, pid: str, ok: bool, text: str):
@@ -2321,20 +2745,33 @@ class MainWindow(QMainWindow):
         self.btn_region.setChecked(not full)
         self.monitor_row.setVisible(full)
         self.region_row.setVisible(not full)
-        if not self.capturer.region_ok(self.d["region"]):
-            self.d["region"] = None
-        self.region_label.setText(describe_region(self.d["region"]))
+        self._refresh_region_label()
+
+    def _refresh_region_label(self):
+        region = self.d["region"]
+        if not region:
+            self.region_label.setText("No region selected")
+            return
+        err = self.capturer.region_error(region)  # never discards the stored region; it only says why it is unusable
+        text = describe_region(region)
+        self.region_label.setText(text if not err else f"{text}  \u00b7  not usable: {err}")
 
     def refresh_monitors(self):
         self.monitor_combo.blockSignals(True)
         self.monitor_combo.clear()
-        items = self.capturer.list_monitors()
+        try:
+            items = self.capturer.list_monitors()
+        except CaptureError as exc:
+            items = [("Primary / focused monitor", "auto"), ("All monitors", "all")]
+            self.add_log("warn", str(exc))
         for label, key in items:
             self.monitor_combo.addItem(label, key)
         idx = self.monitor_combo.findData(self.d["monitor"])
-        if idx < 0:
-            idx = 0
-            self.d["monitor"] = "auto"
+        if idx < 0:  # keep the choice visible; a scan then fails with a clear error instead of switching screens
+            self.monitor_combo.addItem(f"{self.d['monitor']} (not connected)", self.d["monitor"])
+            idx = self.monitor_combo.count() - 1
+            self.add_log("warn", f"The configured monitor '{self.d['monitor']}' is not connected. "
+                                 "Choose another one on the Capture page.")
         self.monitor_combo.setCurrentIndex(idx)
         self.monitor_combo.blockSignals(False)
 
@@ -2381,8 +2818,10 @@ class MainWindow(QMainWindow):
             return
         if region_mode:
             if self.capturer.region_ok(self.d["region"]):
-                self._begin("region", self.d["region"])
+                self._begin("region", dict(self.d["region"]))
             else:
+                if self.d["region"] is not None:
+                    self.add_log("warn", f"{self.capturer.region_error(self.d['region'])} Opening the selector.")
                 self.select_region(self._region_then_start)
         else:
             self._begin("full", None)
@@ -2394,8 +2833,7 @@ class MainWindow(QMainWindow):
         self._begin("region", region)
 
     def _begin(self, mode: str, region):
-        self.sink.reset_session()
-        self.rec = Recorder(self, mode, region)
+        self.rec = Recorder(self.service, self.bus, lambda: self.d, mode, region)
         self.rec.start()
         self._set_state("recording")
         what = "full screen" if mode == "full" else f"region {describe_region(region)}"
@@ -2438,97 +2876,159 @@ class MainWindow(QMainWindow):
     def _store_region(self, region):
         self.d["region"] = region
         self.save_soon()
-        self.region_label.setText(describe_region(region))
+        self._refresh_region_label()
         self.add_log("ok", f"Region set: {describe_region(region)}")
 
-    def select_region(self, callback):
-        """Calls callback(region, image) on the GUI thread; both None if cancelled."""
-        if self._selecting:
-            return
+    def select_region(self, callback) -> bool:
+        """Starts a selection. callback(region, image) runs on the GUI thread; both None if it was
+        cancelled or failed (the reason is logged). Returns False if a selection could not be started."""
+        if self._selecting or self._closing:
+            return False
         self._selecting = True
         self._select_cb = callback
+        self._restore_state = None
         hide = bool(self.d["hide_on_select"]) and self.isVisible()
-        self._restore_after = hide
         if hide:
+            self._restore_state = (self.windowState(), self.isActiveWindow())
             self.hide()
-        delay = 0.3 if hide else 0.0
-        if self.capturer.wayland:
-            threading.Thread(target=self._select_worker_wayland, args=(delay,), daemon=True).start()
-        else:
-            QTimer.singleShot(int(max(delay, 0.03) * 1000), self._start_overlay)
+        threading.Thread(target=self._select_worker, args=(0.3 if hide else 0.03,), daemon=True).start()
+        return True
 
-    def _select_worker_wayland(self, delay: float):
+    def _select_worker(self, delay: float):
+        """Screenshot / slurp work happens here so the GUI stays responsive."""
         time.sleep(delay)
         try:
-            region = self.capturer.select_region_wayland()
-            img = self.capturer.grab_region(region) if region else None
-            self.bus.select_done.emit((region, img, None))
-        except Exception as exc:
-            self.bus.select_done.emit((None, None, str(exc)))
+            if self.capturer.wayland:
+                region = self.capturer.select_region_wayland()
+                img = self.capturer.grab_region(region) if region else None
+                self.bus.post("select_done", (region, img, None))
+            else:
+                self.bus.post("shots_ready", self.capturer.grab_all_monitors())
+        except (CaptureError, OSError) as exc:
+            self.bus.post("select_done", (None, None, str(exc)))
+        except Exception as exc:  # thread boundary: the GUI must always get a result or it stays stuck selecting
+            log.exception("Region selection failed")
+            self.bus.post("select_done", (None, None, f"Region selector failed: {exc}"))
 
-    def _start_overlay(self):
+    def _on_shots_ready(self, shots):
+        if not self._selecting or self._closing:
+            return
         try:
-            shots = self.capturer.grab_all_monitors()
-            self._overlay = OverlayManager(shots, QGuiApplication.screens())
-            self._overlay.finished.connect(self._on_overlay_finished)
-            self._overlay.start()
-        except Exception as exc:
+            mgr = OverlayManager(shots, QGuiApplication.screens())
+            if mgr.unmatched:
+                self.add_log("warn", f"{len(mgr.unmatched)} screen(s) could not be matched to a capture monitor "
+                                     "and cannot be used for selection.")
+            self._overlay = mgr
+            mgr.finished.connect(self._on_overlay_finished)
+            mgr.start()
+        except Exception as exc:  # GUI boundary: whatever fails here must still end the selection state
+            log.exception("Could not open the region selector")
             self._on_select_done((None, None, f"Region selector failed: {exc}"))
 
-    def _on_overlay_finished(self, payload):
+    def _on_overlay_finished(self, payload, err: str):
         self._overlay = None
         if payload is None:
-            self._on_select_done((None, None, None))
+            self._on_select_done((None, None, err or None))
         else:
             self._on_select_done((payload[0], payload[1], None))
 
     def _on_select_done(self, payload):
+        if not self._selecting:
+            return
         region, img, err = payload
         self._selecting = False
-        if self._restore_after:
-            self._restore_after = False
-            self.showNormal()
-            self.raise_()
-            self.activateWindow()
+        self._restore_window()
         cb, self._select_cb = self._select_cb, None
         if err:
             self.add_log("err", err)
-        elif region is None:
+        elif region is None or img is None:
             self.add_log("info", "Selection cancelled.")
+        ok = not err and region is not None and img is not None
         if cb:
-            cb(None if err else region, None if err else img)
+            cb(region if ok else None, img if ok else None)
 
-    # one shot scan
+    def _restore_window(self):
+        st, self._restore_state = self._restore_state, None
+        if st is None:
+            return
+        state, was_active = st
+        if state & Qt.WindowState.WindowMinimized:
+            self.showMinimized()
+            return
+        if state & Qt.WindowState.WindowMaximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+        self.raise_()
+        if was_active:  # do not steal focus from another app if we were not focused before
+            self.activateWindow()
+
+    def _cancel_selection(self):
+        if self._overlay is not None:
+            self._overlay.cancel()
+            self._overlay = None
+        self.capturer.cancel_selection()
+        self._selecting = False
+        self._select_cb = None
+
+    # region hotkey: pick a NEW region and scan it once (the region is not stored)
     def one_shot(self):
-        if self._oneshot_busy or self._selecting:
+        if self._closing or self._oneshot_busy or self._selecting:
             return
         if not self._ready(need_region=True):
             return
         self._oneshot_busy = True
-        self.select_region(self._oneshot_selected)
+        if not self.select_region(self._oneshot_selected):
+            self._oneshot_busy = False
 
     def _oneshot_selected(self, region, img):
         if region is None or img is None:
             self._oneshot_busy = False
             return
         self.add_log("info", "Reading region...")
-        threading.Thread(target=self._oneshot_worker, args=(img,), daemon=True).start()
+        threading.Thread(target=self._scan_worker, args=("region", lambda: self.service.process_image(img, force=True)),
+                         daemon=True).start()
 
-    def _oneshot_worker(self, img):
+    # scan-current hotkey: the stored region (region mode) or the configured screen (full mode), no selector
+    def scan_current(self):
+        if self._closing:
+            return
+        if self._scan_busy:
+            self.add_log("info", "A scan is already running.")
+            return
+        mode = self.d["mode"]
+        region = dict(self.d["region"]) if isinstance(self.d["region"], dict) else self.d["region"]
+        monitor = self.d["monitor"]
+        if mode == "region":
+            err = self.capturer.region_error(region)
+            if err:  # no OCR, and no fallback to full screen
+                self._report_error(f"Scan current: {err}")
+                return
+        if not self._ready(need_region=False):
+            return
+        self._scan_busy = True
+        self.add_log("info", "Scanning the stored region..." if mode == "region" else "Scanning the screen...")
+        threading.Thread(target=self._scan_worker,
+                         args=("current", lambda: self.service.scan_current(mode, region, monitor)), daemon=True).start()
+
+    def _scan_worker(self, kind: str, job):
         try:
-            text, written, provider = self.process_image(img, force=True)
-            self.bus.result.emit(text, written, provider, "scan")
-        except Exception as exc:
-            self.bus.log.emit("err", str(exc))
-            self.bus.notify.emit(APP_NAME, f"Scan failed: {str(exc)[:120]}")
+            text, written, provider = job()
+            self.bus.post("result", text, written, provider, "scan")
+        except (CaptureError, OCRError, OutputError) as exc:
+            log.warning("Scan (%s) failed: %s", kind, exc)
+            self.bus.post("failure", f"Scan failed: {exc}")
+        except Exception as exc:  # thread boundary
+            log.exception("Scan (%s) failed unexpectedly", kind)
+            self.bus.post("failure", f"Scan failed unexpectedly: {exc.__class__.__name__}: {exc}")
         finally:
-            self._oneshot_busy = False
+            self.bus.post("job_done", kind)
 
-    
-    def process_image(self, img, force: bool = False):
-        text, provider = self.ocr.recognize(img, self.d["max_side"])
-        written = self.sink.write(text, force=force) if text else 0
-        return text, written, provider
+    def _on_job_done(self, kind: str):
+        if kind == "region":
+            self._oneshot_busy = False
+        else:
+            self._scan_busy = False
 
     def on_result(self, text: str, lines: int, provider: str, source: str):
         self.captures += 1
@@ -2553,6 +3053,8 @@ class MainWindow(QMainWindow):
             self.activateWindow()
         elif cmd == "region":
             self.one_shot()
+        elif cmd == "current":
+            self.scan_current()
         elif cmd == "toggle":
             if self.rec is not None:
                 self.stop_recording()
@@ -2573,22 +3075,46 @@ class MainWindow(QMainWindow):
         self._really_quit = True
         self.close()
 
+    def shutdown(self):
+        """Idempotent. Stops everything that could still call into Qt objects."""
+        if self._closing:
+            return
+        self._closing = True
+        self.bus.close()  # worker threads may keep running; their signals are now dropped
+        self._cancel_selection()
+        if self.rec is not None:
+            self.rec.stop()
+            self.rec = None
+        self.hotkeys.stop()
+        if self.ipc is not None:
+            self.ipc.close()
+        self._save_timer.stop()
+        self.cfg.save()
+
     def closeEvent(self, event):
         if (self.d["tray_on_close"] and self.tray is not None and self.tray.isVisible()
                 and not self._really_quit):
             event.ignore()
             self.hide()
             return
-        if self.rec is not None:
-            self.rec.stop()
-        self.hotkeys.stop()
-        if self.ipc is not None:
-            self.ipc.close()
-        self._save_timer.stop()
-        self.cfg.save()
+        self.shutdown()
         event.accept()
         QApplication.quit()
 
+
+def setup_logging():
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    log.setLevel(logging.INFO)
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    log.addHandler(stream)
+    try:
+        config_dir().mkdir(parents=True, exist_ok=True)
+        fh = RotatingFileHandler(config_dir() / "ocr-scanner.log", maxBytes=512_000, backupCount=2, encoding="utf-8")
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+    except OSError as exc:
+        log.warning("Could not open the log file: %s", exc)
 
 
 def main() -> int:
@@ -2607,20 +3133,28 @@ def main() -> int:
     except Exception:
         app.setStyleSheet(QSS.replace("image: url(\"@CHECK@\");", "").replace("image: url(\"@ARROW@\");", ""))
 
+    setup_logging()
     cfg = Config()
     bus = Bus()
     get_cfg = lambda: cfg.data  # noqa: E731
-    ocr, sink, capturer = OCRClient(get_cfg), TextSink(get_cfg), Capturer()
+    session = SessionOutput(cfg.data["output_file"])  # one new output file per launch
+    startup_error = ""
+    try:
+        session.ensure()
+    except OutputError as exc:
+        startup_error = str(exc)
+    service = ScanService(get_cfg, Capturer(), OCRClient(get_cfg), TextSink(get_cfg, session))
 
-    ipc = IPCServer(lambda cmd: bus.command.emit(cmd))
+    ipc = IPCServer(lambda cmd: bus.post("command", cmd))
     ipc_ok = ipc.bind()
-    win = MainWindow(cfg, bus, capturer, ocr, sink, ipc_ok)
+    win = MainWindow(cfg, bus, service, session, ipc_ok, startup_error)
+    app.aboutToQuit.connect(win.shutdown)
     if ipc_ok:
         win.ipc = ipc
         ipc.start()
     win.show()
     code = app.exec()
-    cfg.save()
+    win.shutdown()
     return code
 
 
