@@ -1,9 +1,3 @@
-"""Start the daemon at login without root / admin rights. Qt-free.
-
-Linux:   a systemd *user* unit (~/.config/systemd/user/ocr-scanner.service).
-Windows: a per-user value under HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run
-         (no administrator needed, unlike a Task Scheduler logon trigger on many Windows versions).
-"""
 from __future__ import annotations
 
 import os
@@ -21,7 +15,8 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "OCRScanner"
 # the graphical session's variables the daemon needs for grim/slurp, mss and pynput
 SESSION_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
-                "HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+                "HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_DESKTOP",
+                "DESKTOP_SESSION", "SWAYSOCK")
 
 
 # systemd (Linux)
@@ -58,7 +53,7 @@ def render_unit(python: str, script: str) -> str:
         "Environment=PYTHONUNBUFFERED=1\n"
         "\n"
         "[Install]\n"
-        "WantedBy=hyprland-session.target\n"
+        "WantedBy=graphical-session.target hyprland-session.target\n"
     )
 
 
@@ -77,7 +72,7 @@ def render_gui_unit(python: str, script: str, daemon_unit: str = UNIT_NAME) -> s
         "Environment=PYTHONUNBUFFERED=1\n"
         "\n"
         "[Install]\n"
-        "WantedBy=hyprland-session.target\n"
+        "WantedBy=graphical-session.target hyprland-session.target\n"
     )
 
 

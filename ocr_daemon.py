@@ -1,15 +1,3 @@
-"""OCR Scanner background daemon. Runs without PySide6 and without a display server connection of its own.
-
-It owns screen capture, OCR, recording, output files, global hotkeys, the configuration it reads, and the
-local IPC endpoint. The GUI (ocr_scanner.py) and `--trigger` are only clients of it.
-
-    python ocr_daemon.py run          run in the foreground (what systemd / the Windows startup entry use)
-    python ocr_daemon.py start        start it detached in the background (no-op if already running)
-    python ocr_daemon.py stop         ask it to shut down
-    python ocr_daemon.py status       show its state (exit code 1 if it is not running)
-    python ocr_daemon.py autostart enable|disable|status
-    python ocr_daemon.py service start|stop|restart|status     (Linux, systemd user service)
-"""
 from __future__ import annotations
 
 import argparse
@@ -25,7 +13,8 @@ from collections import deque
 
 from ocr_core import (
     APP_NAME, IS_LINUX, IS_WINDOWS, VERSION, CaptureError, Capturer, Config, OCRClient, OCRError, OutputError,
-    Recorder, ScanService, SessionOutput, TextSink, HotkeyManager, describe_region, log, setup_logging,
+    Recorder, ScanService, SessionOutput, TextSink, HotkeyManager, describe_region, detect_session, log,
+    setup_logging,
 )
 from ocr_ipc import (
     GUI_SCRIPT, IPCError, IPCServer, InstanceLock, daemon_running, request, spawn_detached, start_daemon,
@@ -120,7 +109,10 @@ class Daemon:
         self.apply_hotkeys()
         self._warm_local()
         threading.Thread(target=self._watchdog, daemon=True, name="watchdog").start()
-        log.info("%s daemon %s started (pid %s, %s)", APP_NAME, VERSION, os.getpid(), self.capturer.backend)
+        log.info("%s daemon %s started (pid %s, %s, session %s)", APP_NAME, VERSION, os.getpid(),
+                 self.capturer.backend, detect_session())
+        if self.cfg.secret_status:
+            self.log_event("warn", self.cfg.secret_status)
         self.events.push("log", level="info", message=f"Daemon started. Capture backend: {self.capturer.backend}")
         if self.session.path is not None:
             self.events.push("log", level="info", message=f"This session writes to {self.session.path}")
@@ -247,7 +239,7 @@ class Daemon:
             self.failure(f"Hotkey action failed: {exc.__class__.__name__}: {exc}")
 
     def apply_hotkeys(self):
-        ok, msg, level = self.hotkeys.apply(self.d["hotkeys"])
+        ok, msg, level = self.hotkeys.apply(self.d["hotkeys"], self.d.get("wayland_hotkeys", "auto"))
         self.hotkey_status = (ok, msg, level)
         if level == "err":
             self.failure(f"Hotkeys: {msg}")
@@ -263,6 +255,11 @@ class Daemon:
         if err:
             self.hotkey_status = (False, err, "err")
             self.failure(err)
+            return
+        update = self.hotkeys.portal_status()  # a portal dialog may be answered long after apply() returned
+        if update is not None and update != self.hotkey_status:
+            self.hotkey_status = update
+            self.log_event("ok" if update[0] else "warn", update[1])
 
     def _watchdog(self):
         while not self.stop_evt.wait(WATCHDOG_INTERVAL):
@@ -297,6 +294,8 @@ class Daemon:
             "session_file": str(self.session.path) if self.session.path else None,
             "session_error": self.startup_error or None,
             "hotkeys": {"ok": ok, "message": msg, "level": level, "running": self.hotkeys.running},
+            "session": detect_session(),
+            "credential_store": {"secure": self.cfg.secrets.available, "warning": self.cfg.secret_status},
             "backend": self.capturer.backend, "gui_connected": self.gui_connected(),
             "uptime": int(time.time() - self.started_at),
         }
@@ -537,6 +536,21 @@ class Daemon:
         return {"started": True}
 
 
+def _session_text(sess) -> str:
+    if not isinstance(sess, dict):
+        return "unknown"
+    parts = [sess.get("distro_name") or sess.get("os"), sess.get("desktop"), sess.get("session_type")]
+    return ", ".join(str(p) for p in parts if p and p != "unknown") or "unknown"
+
+
+def _keys_text(store) -> str:
+    if not isinstance(store, dict):
+        return "unknown"
+    if store.get("secure"):
+        return "system credential store" + (f" (warning: {store['warning']})" if store.get("warning") else "")
+    return "config file, not encrypted" + (f" ({store['warning']})" if store.get("warning") else "")
+
+
 def _status_text(data: dict) -> str:
     hk = data.get("hotkeys", {})
     lines = [
@@ -545,6 +559,8 @@ def _status_text(data: dict) -> str:
         f"scans:      {data.get('captures')}  lines saved: {data.get('lines')}",
         f"output:     {data.get('session_file') or '(none)'}",
         f"hotkeys:    {hk.get('message')}",
+        f"session:    {_session_text(data.get('session'))}",
+        f"API keys:   {_keys_text(data.get('credential_store'))}",
         f"GUI:        {'connected' if data.get('gui_connected') else 'not connected'}",
         f"backend:    {data.get('backend')}",
     ]

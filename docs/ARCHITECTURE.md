@@ -21,6 +21,8 @@ OCR Scanner is two processes that talk over local IPC.
 
 | File | Imports Qt | Role |
 |---|---|---|
+| `ocr_secrets.py` | no | API keys in the OS credential store (Windows Credential Manager / Linux Secret Service) via `keyring` |
+| `ocr_portal.py` | no | Wayland global shortcuts through the XDG GlobalShortcuts portal (`jeepney`) |
 | `ocr_core.py` | no | Everything that used to be Qt-free in the old single file: config, `Capturer`, region validation, OCR providers, `LocalOCR`, `OCRClient`, `TextSink`, `ScanService`, `HotkeyManager`, `Recorder`, `SessionOutput`, hotkey helpers. Moved, not rewritten |
 | `ocr_ipc.py` | no | Protocol, `IPCServer`, client (`request`, `send_command`), `InstanceLock`, `cli_trigger`, process spawning |
 | `ocr_daemon.py` | no | `Daemon` (command handlers, event buffer, watchdog), CLI: `run/start/stop/status/autostart/service` |
@@ -37,7 +39,7 @@ OCR Scanner is two processes that talk over local IPC.
 | Global hotkeys (pynput) and the hotkey watchdog | daemon |
 | Wayland region selection (`slurp`) | daemon |
 | X11 / Windows region selection overlay | GUI (a Qt overlay); the daemon asks for it |
-| Settings file (`config.json`, API keys) | **GUI is the only writer**; the daemon only reads it (`reload_config`) |
+| Settings file (`config.json`) and API keys (credential store) | **GUI is the only writer** and the only process that migrates plain-text keys; the daemon only reads them (`reload_config`) |
 | Tray icon, notifications while the GUI runs | GUI. With no GUI connected the daemon uses `notify-send` on Linux |
 
 The daemon never writes `config.json`, so there are no two-writer races, and credentials never cross IPC.

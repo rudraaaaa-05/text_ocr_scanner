@@ -1,6 +1,6 @@
 # OCR Scanner
 
-Read text from your screen with **offline local OCR** or free (and paid) AI APIs, and append it to a plain text file, one line per line of text.
+Read text from your screen with **offline local OCR** or free (and paid) AI APIs.
 
 ## Features
 
@@ -14,17 +14,18 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 
 ## Platform support
 
+Verified compatibility per distribution, desktop and Windows is tracked separately in [COMPATIBILITY.md](docs/COMPATIBILITY.md).
+
 | Platform | Status |
 |---|---|
 | Linux, Hyprland / sway / other wlroots Wayland | Primary target (uses `grim` + `slurp`; hotkeys via compositor binds and `--trigger`) |
 | Linux, X11 | Supported (built-in region selector, `mss` capture, global hotkeys via `pynput`) |
 | Linux, GNOME / KDE on Wayland | Not supported (use an X11 session) |
 | Windows | Supported by design (same Qt selector, `mss`, `pynput`). The coordinate mapping (negative monitor origins, display scaling) and hotkey logic are unit-tested, work in progress|
-| macOS | Written for, work in progress |
 
 ### System requirements per platform
 
-- **Windows / Linux X11 / macOS:** the Python packages in `requirements.txt` (`PySide6`, `Pillow`, `requests`, `mss`, `pynput`, a local OCR engine). Nothing else.
+- **Windows / Linux X11 :** the Python packages in `requirements.txt` (`PySide6`, `Pillow`, `requests`, `mss`, `pynput`, a local OCR engine). Nothing else.
 - **Linux Wayland (Hyprland, sway, ...):** `grim` (screenshots) and `slurp` (region selector), e.g. `sudo pacman -S grim slurp`. `hyprctl` is used on Hyprland to list and pick monitors. `pynput` is installed but not used on Wayland.
 - **Region selection limits:** on Wayland the stored region is checked for a valid shape and size only. It cannot be checked against monitor changes, so after changing your monitor setup select the region again. On X11 / Windows it is checked against the current monitors automatically (see below).
 
@@ -77,9 +78,6 @@ What it covers:
 
 - **Languages:** Japanese, Chinese (Simplified and Traditional), English, and Latin-script languages such as German, French, Spanish, Portuguese, Italian and Vietnamese. **Korean, Russian, Arabic, Hindi and Thai are not covered.** Use a cloud provider for those.
 - **Extra instructions** in Settings apply to cloud providers only. Local OCR reads exactly what is printed.
-- **Furigana** is read as its own line above the main line.
-- **Vertical Japanese** is only lightly tested, and right-to-left column order is not handled.
-- The engine loads in the background at startup, so the first scan is not the slow one.
 
 ## Background daemon
 
@@ -142,26 +140,18 @@ The stored region is set with **Select region** on the Capture page (or when you
 
 Other triggers: `start`, `stop`, `show`, plus `resume` (resume only; `pause` toggles) and `status` / `shutdown`. All of them: `region`, `current`, `toggle`, `start`, `stop`, `pause`, `show`, `resume`, `status`, `shutdown`. The **daemon** must be running (`python ocr_daemon.py start`, or open the window once). `ocr_scanner.py --trigger ...` is unchanged and does not need Qt. If region mode has no valid stored region, `start` / `toggle` report an error instead of opening a selector (use *Select region* in the window first).
 
-### Windows, X11, macOS
+### Windows, X11
 
-Global hotkeys run inside the daemon through `pynput` and can be changed in Settings. If registration fails (pynput missing, no X display, a key assigned twice, macOS permissions) the reason is shown in Settings, in the activity log and as a notification; nothing fails silently. Hotkeys keep working with the window closed and are released when the daemon exits. Two actions cannot share one key.
+Global hotkeys run inside the daemon through `pynput` and can be changed in Settings. If registration fails (pynput missing, no X display, a key assigned twice, etc) the reason is shown in Settings, in the activity log and as a notification; nothing fails silently. Hotkeys keep working with the window closed and are released when the daemon exits. Two actions cannot share one key.
 
 ### Wayland
 
-Wayland apps cannot grab global keys, so you bind keys in your compositor to call `--trigger`. Settings shows ready-made lines for your keys. Example (Hyprland Lua):
+Wayland apps cannot grab global keys themselves. On desktops whose XDG portal offers `GlobalShortcuts` (for example KDE Plasma and recent GNOME) the daemon registers the keys through the portal; the desktop may show a confirmation dialog the first time. Hyprland keeps compositor binds by default. Where the portal is not available, you bind keys in your desktop to call `--trigger`, and Settings shows ready-made instructions for your desktop. `wayland_hotkeys` in `config.json` can be `auto` (default), `portal` or `manual`. What has and has not been verified on real systems is listed in [COMPATIBILITY.md](COMPATIBILITY.md). Example (Hyprland Lua):
 
 ```lua
 hl.bind("CTRL + ALT + O", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger region"))
 hl.bind("CTRL + ALT + S", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger current"))
 ```
-
-## Testing
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-`tests/test_ocr_scanner.py` covers the Qt-free logic and `tests/test_daemon.py` covers the daemon: it starts real daemon processes in a temporary config dir (duplicate prevention, SIGTERM, crash recovery, `--trigger`, GUI link reconnect), plus IPC validation/timeouts/tokens, autostart (fake `systemctl` / registry) and commands with fake capture/OCR. Together they cover session files, duplicate filtering, region validation, coordinate mapping (negative origins, display scaling, multiple monitors), full-screen / region routing, scan-current, hotkey mapping and cleanup, and shutdown handling. They do not need a display or PySide6; the daemon test also proves the daemon modules import without it. They do **not** exercise the real Qt overlay, tray, `pynput` or `grim`/`slurp`; verify those by hand on your platform, together with a real `systemctl --user` enable and the Windows startup entry.
 
 ## Privacy
 
@@ -192,24 +182,13 @@ python -m unittest discover -s tests -v
 | "Local OCR does not cover Korean" (or Russian, Arabic, Hindi, Thai) | Not supported locally. Switch to a cloud provider |
 | Medium model fails to load | It downloads on first use and needs internet. Switch back to Small, which works offline |
 | Qt fails to start on X11 | Install `libxcb-cursor0` (Ubuntu) or `xcb-util-cursor` (Arch) |
-| macOS hotkeys silent | Grant Screen Recording and Accessibility permission |
-
-
-
-
-
-
-
-
-
-
 
 ## Roadmap
 
-The goal is to grow this from a script into a proper installable app that runs quietly in the background and works fully on Windows, macOS and Linux. Items 2 onward are not done yet. It is ordered roughly by priority.
+The goal is to grow this from a script into a proper installable app that runs quietly in the background and works fully on Windows and Linux. 
 
 ### 1. Background service
-**Phase 1 is done for Linux and Windows**: the core daemon, the thin GUI, per-user IPC, tray actions, systemd user service and Windows startup entry (see [Background daemon](#background-daemon)). Not done: a macOS LaunchAgent, and moving API keys out of `config.json` (planned, deliberately not part of Phase 1).
+The core daemon, the thin GUI, per-user IPC, tray actions, systemd user service and Windows startup entry (see [Background daemon](#background-daemon)). ✅ DONE
 
 ### 2. Packaging
 Goal: install it without touching Python or a terminal.
@@ -229,11 +208,9 @@ Notes:
 
 | Gap | Plan |
 |---|---|
-| GNOME / KDE on Wayland has no capture | Use the xdg-desktop-portal Screenshot / ScreenCast APIs |
+| GNOME / KDE on Wayland has no capture | Use the xdg-desktop-portal Screenshot |
 | Wayland global hotkeys need manual compositor binds | Use the GlobalShortcuts portal where the compositor supports it (verify support per compositor) |
-| Windows and macOS are barely tested | Test on real machines: multi-monitor, mixed DPI scaling, Retina |
-| macOS permissions | Guide users through Screen Recording and Accessibility grants on first run |
-| API keys are stored in plain JSON | Move to the OS keyring (Credential Manager, Keychain, Secret Service) |
+| Windows is barely tested | Test on real machines: multi-monitor, mixed DPI scaling, Retina |
 
 ### 4. Quality and releases
 - GitHub Actions CI on Linux, Windows and macOS with headless tests, covering the OCR pipeline, config handling, hotkey parsing and IPC.
@@ -242,5 +219,4 @@ Notes:
 
 ### 5. Ideas (not committed)
 - Language-learning extras: word lookup, furigana, Anki export.
-- More providers.
 - Per-profile settings (for example one for games, one for manga).

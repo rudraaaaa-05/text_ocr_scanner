@@ -1,18 +1,3 @@
-"""Local IPC between the daemon, the GUI and the ``--trigger`` command line. Stdlib only, no Qt.
-
-Transport
-    Linux:   a Unix domain socket in $XDG_RUNTIME_DIR (a per-user 0700 directory), chmod 0600. Every
-             connection's peer uid is also checked (SO_PEERCRED).
-    Windows: a TCP socket bound to 127.0.0.1 on an ephemeral port. The port and a random token are written
-             to ``ipc-endpoint.json`` in the per-user config folder, and every request must carry the
-             token. Nothing listens on a public interface.
-
-Protocol (one request and one reply per connection, one line each, UTF-8, max 64 KiB)
-    request  {"cmd": "status", "args": {...}, "token": "..."}
-    reply    {"ok": true, "data": {...}}   or   {"ok": false, "error": {"code": "...", "message": "..."}}
-    The old plain-text form ("region\\n") is still accepted on Unix and answered with "ok\\n" or
-    "error: <message>\\n", so existing scripts and compositor bindings keep working.
-"""
 from __future__ import annotations
 
 import hmac

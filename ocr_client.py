@@ -1,4 +1,3 @@
-"""Client side of the daemon link: polls the daemon for events and (re)starts it when asked. Qt-free."""
 from __future__ import annotations
 
 import threading
@@ -10,12 +9,6 @@ POLL_INTERVAL = 0.5
 
 
 class DaemonLink(threading.Thread):
-    """Polls `events` and reports through callbacks (called on THIS thread: forward them to the GUI thread).
-
-    on_update(reply, replay): reply is the `events` data; replay is True for the first batch after
-        (re)connecting, which holds history the GUI has not seen (do not notify or act on it).
-    on_connection(connected): called when the link goes up or down.
-    """
 
     def __init__(self, on_update, on_connection):
         super().__init__(daemon=True, name="daemon-link")

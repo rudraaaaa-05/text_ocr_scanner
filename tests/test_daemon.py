@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+os.environ.setdefault("OCR_SCANNER_KEYRING", "off")  # tests must never touch the real credential store
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
@@ -588,7 +590,7 @@ class SystemdTests(IsolatedEnv):
         text = autostart.render_unit("/usr/bin/python3", "/opt/my app/ocr_daemon.py")
         self.assertIn('ExecStart="/usr/bin/python3" "/opt/my app/ocr_daemon.py" run', text)
         self.assertIn("Restart=on-failure", text)
-        self.assertIn("WantedBy=default.target", text)
+        self.assertIn("WantedBy=graphical-session.target hyprland-session.target", text)
         self.assertNotIn("User=", text)
         self.assertIn("%%", autostart.render_unit("/p%y", "/s"))
 

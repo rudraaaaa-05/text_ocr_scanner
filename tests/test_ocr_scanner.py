@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
+os.environ.setdefault("OCR_SCANNER_KEYRING", "off")  # tests must never touch the real credential store
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))

@@ -1,7 +1,3 @@
-"""OCR Scanner GUI. A thin client: capture, OCR, recording, hotkeys and the output file all live in the
-background daemon (ocr_daemon.py); this window shows its state, edits the settings and hosts the region
-selector. Closing it never stops the daemon.
-"""
 from __future__ import annotations
 
 import html
@@ -1122,14 +1118,17 @@ class MainWindow(QMainWindow):
         # compositor binds (Linux)
         self.bind_card = None
         if IS_LINUX:
-            card, cl = make_card("Hyprland / compositor binds",
-                                 "On Wayland the compositor owns global keys. Paste these into your config; they trigger the running app.")
+            self.desktop = detect_desktop()
+            card, cl = make_card("Manual hotkey setup" if self.desktop != "hyprland" else "Hyprland / compositor binds",
+                                 "Used when the desktop portal can't register global hotkeys (see the status above). "
+                                 "Set them up once in your desktop; they trigger the running app.")
             self.syntax_combo = QComboBox()
             self.syntax_combo.addItem("Hyprland Lua (0.55+)", "lua")
             self.syntax_combo.addItem("Hyprland hyprlang (hyprland.conf)", "conf")
             cur = self.d["hypr_syntax"] if self.d["hypr_syntax"] in ("lua", "conf") else detect_hypr_syntax()
             self.syntax_combo.setCurrentIndex(0 if cur == "lua" else 1)
             self.syntax_combo.currentIndexChanged.connect(self._syntax_changed)
+            self.syntax_combo.setVisible(self.desktop == "hyprland")
             self.snippet = QPlainTextEdit()
             self.snippet.setReadOnly(True)
             self.snippet.setFixedHeight(190)
@@ -1259,7 +1258,7 @@ class MainWindow(QMainWindow):
     def refresh_snippet(self):
         if self.bind_card is None:
             return
-        self.snippet.setPlainText(hypr_snippet(self.d["hotkeys"], self.syntax_combo.currentData()))
+        self.snippet.setPlainText(manual_bind_help(self.d["hotkeys"], self.desktop, self.syntax_combo.currentData()))
 
     
     def on_provider_edit(self, card: ProviderCard):
@@ -1608,7 +1607,7 @@ def main() -> int:
         app.setStyleSheet(QSS.replace("image: url(\"@CHECK@\");", "").replace("image: url(\"@ARROW@\");", ""))
 
     setup_logging()
-    cfg = Config()
+    cfg = Config(writer=True)  # the GUI is the one process that migrates plain-text API keys
     bus = Bus()
     win = MainWindow(cfg, bus)
     app.aboutToQuit.connect(win.shutdown)
@@ -1618,6 +1617,10 @@ def main() -> int:
     else:
         win.show()
     win.connect_daemon()
+    if cfg.migrated:
+        win.add_log("ok", "API keys were moved from the config file to the system credential store.")
+    if cfg.secret_status:
+        win.add_log("warn", cfg.secret_status)
     code = app.exec()
     win.shutdown()
     lock.release()

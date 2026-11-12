@@ -1,8 +1,3 @@
-"""Qt-free core of OCR Scanner: configuration, capture, OCR providers, scan pipeline, hotkeys, recorder.
-
-Imported by both the background daemon (ocr_daemon.py) and the GUI client (ocr_scanner.py).
-It must never import PySide6; tests assert that.
-"""
 from __future__ import annotations
 
 import base64
@@ -25,9 +20,11 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from pathlib import Path
 
+from ocr_secrets import SecretStoreError, default_store
+
 APP_NAME = "OCR Scanner"
 APP_ID = "ocr-scanner"
-VERSION = "1.2"
+VERSION = "0.4"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
@@ -56,6 +53,74 @@ def is_hyprland() -> bool:
         bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"))
         or "hyprland" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
     )
+
+
+# Session detection. Used for hotkey strategy and the setup help; capture has its own checks (is_wayland above).
+
+_DESKTOP_NAMES = (  # (substring of XDG_CURRENT_DESKTOP / DESKTOP_SESSION, canonical name)
+    ("hyprland", "hyprland"), ("gnome", "gnome"), ("ubuntu", "gnome"), ("kde", "kde"), ("plasma", "kde"),
+    ("cinnamon", "cinnamon"), ("mate", "mate"), ("xfce", "xfce"), ("lxqt", "lxqt"), ("budgie", "budgie"),
+    ("cosmic", "cosmic"), ("pantheon", "pantheon"), ("deepin", "deepin"), ("sway", "sway"), ("niri", "niri"),
+    ("river", "river"), ("wayfire", "wayfire"), ("labwc", "labwc"), ("i3", "i3"),
+)
+
+
+def detect_desktop(env=None) -> str:
+    """Canonical desktop / compositor name ('hyprland', 'gnome', 'kde', ...) or 'unknown'. Linux only."""
+    env = os.environ if env is None else env
+    if not IS_LINUX:
+        return "unknown"
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "hyprland"
+    names = [n.strip().lower() for n in re.split(r"[:;]", env.get("XDG_CURRENT_DESKTOP", "")) if n.strip()]
+    names.append(env.get("DESKTOP_SESSION", "").strip().lower())
+    for name in names:
+        for needle, canon in _DESKTOP_NAMES:
+            if needle in name:
+                return canon
+    if env.get("SWAYSOCK"):
+        return "sway"
+    return "unknown"
+
+
+def detect_session_type(env=None) -> str:
+    """'wayland', 'x11', 'windows', 'macos' or 'unknown' (a tty or a bare ssh login)."""
+    env = os.environ if env is None else env
+    if IS_WINDOWS:
+        return "windows"
+    if IS_MAC:
+        return "macos"
+    stype = env.get("XDG_SESSION_TYPE", "").lower()
+    if stype == "wayland" or env.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if stype == "x11" or env.get("DISPLAY"):
+        return "x11"
+    return "unknown"
+
+
+def distro_info(path: str = "/etc/os-release") -> dict:
+    """{'id': 'ubuntu', 'like': ['debian'], 'name': 'Ubuntu 24.04 LTS'} from os-release; {} if unreadable."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    fields = {}
+    for line in text.splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, _, v = line.partition("=")
+            fields[k.strip()] = v.strip().strip('"').strip("'")
+    return {"id": fields.get("ID", "").lower(), "like": fields.get("ID_LIKE", "").lower().split(),
+            "name": fields.get("PRETTY_NAME") or fields.get("NAME", "")}
+
+
+def detect_session(env=None) -> dict:
+    """One dict describing where we run, for logs, `status` output and hotkey decisions."""
+    os_name = "windows" if IS_WINDOWS else "macos" if IS_MAC else "linux" if IS_LINUX else sys.platform
+    info = {"os": os_name, "session_type": detect_session_type(env), "desktop": detect_desktop(env)}
+    if IS_LINUX:
+        d = distro_info()
+        info["distro"], info["distro_name"] = d.get("id", ""), d.get("name", "")
+    return info
 
 
 def config_dir() -> Path:
@@ -166,6 +231,8 @@ def default_config() -> dict:
         "tray_on_close": False,
         "notifications": True,
         "hypr_syntax": "auto",
+        # Wayland hotkeys: "auto" (portal, except on Hyprland which keeps compositor binds), "portal", "manual"
+        "wayland_hotkeys": "auto",
     }
 
 
@@ -181,10 +248,28 @@ def _merge(base: dict, over: dict) -> None:
 
 
 class Config:
-    def __init__(self):
+    """config.json plus API keys.
+
+    API keys live in the OS credential store (Windows Credential Manager / Linux Secret Service), not in
+    the JSON file. `data["providers"][id]["keys"]` is still where the rest of the app reads them: load()
+    fills it from the store and save() writes it back there, so no other code had to change.
+
+    Only the GUI creates `Config(writer=True)`. A writer migrates plain-text keys it finds in config.json:
+    store, read back, compare, and only then remove the plain-text copy. The daemon never writes the file;
+    until the GUI has migrated, it simply keeps using the keys it finds in the JSON.
+    If the credential store is unavailable, keys stay in config.json (mode 600) as before and
+    `secret_status` says so. `secret_status` never contains a key.
+    """
+
+    def __init__(self, writer: bool = False, secrets=None):
         self.path = config_dir() / "config.json"
         self.data = default_config()
         self._lock = threading.Lock()
+        self.writer = writer
+        self.secrets = secrets if secrets is not None else default_store()
+        self.secret_status = ""     # "" = fine, otherwise a readable warning (no secrets in it)
+        self.migrated = []          # provider ids whose plain-text key was moved this load
+        self._synced = {}           # provider id -> key text last confirmed to be in the credential store
         self.load()
 
     def load(self):
@@ -207,23 +292,111 @@ class Config:
             self.data["active_provider"] = "gemini"
         if self.data["mode"] not in ("full", "region"):
             self.data["mode"] = "full"
+        if self.data["wayland_hotkeys"] not in ("auto", "portal", "manual"):
+            self.data["wayland_hotkeys"] = "auto"
+        self._load_secrets()
+
+    # API keys
+
+    def _load_secrets(self):
+        self.secret_status, self.migrated = "", []
+        self._synced = {}
+        why = self.secrets.problem()
+        providers = self.data["providers"]
+        if why:
+            if any(str(pc.get("keys", "")).strip() for pc in providers.values()):
+                self.secret_status = (f"Secure key storage is unavailable ({why}). "
+                                      f"API keys stay in {self.path.name} (not encrypted).")
+            return
+        problems, moved = [], []
+        for pid, pc in providers.items():
+            in_file = str(pc.get("keys", ""))
+            try:
+                stored = self.secrets.get(pid)
+            except SecretStoreError as exc:
+                problems.append(str(exc))
+                continue
+            if in_file.strip():
+                if not self.writer:
+                    continue  # the daemon uses the file's copy until the GUI migrates it
+                if stored != in_file:
+                    try:
+                        self.secrets.set_verified(pid, in_file)
+                    except SecretStoreError as exc:
+                        problems.append(str(exc))
+                        continue
+                self._synced[pid] = in_file
+                moved.append(pid)
+            else:
+                pc["keys"] = stored or ""
+                if stored:
+                    self._synced[pid] = stored
+        if moved:  # every moved key was read back and compared above; only now is the plain text removed
+            out = json.loads(json.dumps(self.data))
+            for pid in moved:
+                out["providers"][pid]["keys"] = ""
+            err = self._write_file(out)
+            if err:
+                problems.append(f"The keys were copied to the credential store, but the plain-text copy could not be removed. {err}")
+            else:
+                self.migrated = moved
+                log.info("Moved API keys for %s from %s to the credential store", ", ".join(moved), self.path.name)
+        if problems:
+            self.secret_status = " ".join(problems)
+
+    def _store_secrets(self, out: dict):
+        """Write the keys of self.data to the credential store and blank them in `out` (the JSON payload).
+        A key that could not be stored stays in `out`, so it is never lost."""
+        why = self.secrets.problem()
+        if why:
+            if any(str(pc.get("keys", "")).strip() for pc in self.data["providers"].values()):
+                self.secret_status = (f"Secure key storage is unavailable ({why}). "
+                                      f"API keys are saved in {self.path.name} (not encrypted).")
+            return
+        problems = []
+        for pid, pc in self.data["providers"].items():
+            value = str(pc.get("keys", ""))
+            if value.strip():
+                if self._synced.get(pid) != value:
+                    try:
+                        self.secrets.set_verified(pid, value)
+                    except SecretStoreError as exc:
+                        problems.append(str(exc))
+                        continue
+                    self._synced[pid] = value
+                out["providers"][pid]["keys"] = ""
+            elif pid in self._synced:
+                try:
+                    self.secrets.delete(pid)
+                except SecretStoreError as exc:
+                    problems.append(str(exc))
+                    continue
+                self._synced.pop(pid, None)
+        self.secret_status = " ".join(problems)
+
+    # file
 
     def save(self):
         """Write the config. Returns None on success, otherwise a readable error (never silent)."""
         with self._lock:
-            try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = self.path.with_suffix(".json.tmp")
-                payload = json.dumps(self.data, indent=2, ensure_ascii=False)
-                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(payload)
-                os.replace(tmp, self.path)
-                if not IS_WINDOWS:
-                    os.chmod(self.path, 0o600)  # the file holds API keys
-            except OSError as exc:
-                log.error("Could not save the config to %s: %s", self.path, exc)
-                return f"Could not save settings to {self.path}: {exc.strerror or exc}"
+            out = json.loads(json.dumps(self.data))
+            self._store_secrets(out)
+            return self._write_file(out)
+
+    def _write_file(self, payload_data: dict):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".json.tmp")
+            payload = json.dumps(payload_data, indent=2, ensure_ascii=False)
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp, self.path)
+            if not IS_WINDOWS:
+                os.chmod(self.path, 0o600)  # may still hold keys when the credential store is unavailable
+        except OSError as exc:
+            log.error("Could not save the config to %s: %s", self.path, exc)
+            return f"Could not save settings to {self.path}: {exc.strerror or exc}"
         return None
 
 
@@ -340,6 +513,51 @@ def hypr_snippet(hotkeys: dict, syntax: str) -> str:
     lines.append("Other compositors / desktops: bind your own shortcut to these commands:")
     for action in HOTKEY_ORDER:
         lines.append(f"  {HOTKEY_LABELS[action]:<46} {trigger_cmd(action)}")
+    return "\n".join(lines)
+
+
+def _bind_combo(seq: str, fmt: str):
+    """Shortcut text for desktops other than Hyprland. fmt: 'gtk' (<Ctrl><Alt>o), 'kde' (Ctrl+Alt+O), 'i3' (Ctrl+Mod1+o)."""
+    sp = split_seq(seq)
+    if not sp:
+        return None
+    mods, key = sp
+    k = key.lower() if len(key) == 1 else HYPR_KEYS.get(key, key)
+    if fmt == "gtk":
+        mm = {"Ctrl": "<Ctrl>", "Alt": "<Alt>", "Shift": "<Shift>", "Meta": "<Super>"}
+        return "".join(mm[m] for m in mods) + k
+    if fmt == "i3":
+        mm = {"Ctrl": "Ctrl", "Alt": "Mod1", "Shift": "Shift", "Meta": "Mod4"}
+        return "+".join([mm[m] for m in mods] + [k])
+    return "+".join(mods + [key.upper() if len(key) == 1 else key])
+
+
+def manual_bind_help(hotkeys: dict, desktop: str, hypr_syntax: str = "conf") -> str:
+    """What to do by hand when the desktop portal can't register hotkeys. Hyprland keeps its exact snippet."""
+    if desktop == "hyprland":
+        return hypr_snippet(hotkeys, hypr_syntax)
+    rows = [(a, hotkeys.get(a) or "") for a in HOTKEY_ORDER]
+    lines = []
+    if desktop == "gnome":
+        lines += ["GNOME: Settings > Keyboard > View and Customize Shortcuts > Custom Shortcuts > Add.",
+                  "Create one entry per line below (Name, Command, then press the shortcut):"]
+        lines += [f"  {HOTKEY_LABELS[a]}: {_bind_combo(seq, 'gtk') or '(no key set)'}" for a, seq in rows]
+    elif desktop == "kde":
+        lines += ["KDE Plasma: System Settings > Keyboard > Shortcuts > Add New > Command or Script.",
+                  "Create one entry per line below (command, then the shortcut):"]
+        lines += [f"  {HOTKEY_LABELS[a]}: {_bind_combo(seq, 'kde') or '(no key set)'}" for a, seq in rows]
+    elif desktop in ("sway", "i3"):
+        lines.append(f"# add to your {desktop} config, then reload it")
+        for a, seq in rows:
+            combo = _bind_combo(seq, "i3")
+            if combo:
+                lines.append(f"bindsym {combo} exec {trigger_cmd(a)}  # {HOTKEY_LABELS[a]}")
+    else:
+        lines.append("Add a custom keyboard shortcut in your desktop's settings for each command below.")
+    lines.append("")
+    lines.append("Commands (they talk to the running app):")
+    for a, _seq in rows:
+        lines.append(f"  {HOTKEY_LABELS[a]:<46} {trigger_cmd(a)}")
     return "\n".join(lines)
 
 
@@ -774,6 +992,13 @@ def _err_message(resp) -> str:
     return " ".join(str(msg).split())[:240]
 
 
+def redact(text: str, *keys: str) -> str:
+    """Hide API keys in text that may be shown or logged (some servers echo the rejected key back)."""
+    for k in sorted({k for k in keys if k and len(k) >= 4}, key=len, reverse=True):
+        text = text.replace(k, "***")
+    return text
+
+
 def call_provider(pdef: dict, pc: dict, key: str, data: bytes, mime: str, prompt: str) -> str:
     b64 = base64.b64encode(data).decode("ascii")
     model = (pc.get("model") or "").strip()
@@ -816,7 +1041,7 @@ def call_provider(pdef: dict, pc: dict, key: str, data: bytes, mime: str, prompt
     except requests.exceptions.RequestException as exc:
         raise OCRError(f"network error ({exc.__class__.__name__})")
     if resp.status_code >= 400:
-        raise OCRError(f"HTTP {resp.status_code}: {_err_message(resp)}", skip_provider=resp.status_code == 404)
+        raise OCRError(redact(f"HTTP {resp.status_code}: {_err_message(resp)}", key), skip_provider=resp.status_code == 404)
     try:
         j = resp.json()
         if pdef["kind"] == "gemini":
@@ -854,7 +1079,7 @@ def fetch_models(pdef: dict, pc: dict, key: str) -> list:
                 r = requests.get(f"{pdef['base_url']}/models", headers={"x-goog-api-key": key},
                                  params=params, timeout=20)
                 if r.status_code >= 400:
-                    raise OCRError(f"HTTP {r.status_code}: {_err_message(r)}")
+                    raise OCRError(redact(f"HTTP {r.status_code}: {_err_message(r)}", key))
                 j = r.json()
                 for m in j.get("models", []):
                     name = str(m.get("name", "")).replace("models/", "", 1)
@@ -873,7 +1098,7 @@ def fetch_models(pdef: dict, pc: dict, key: str) -> list:
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         r = requests.get(base + "/models", headers=headers, timeout=20)
         if r.status_code >= 400:
-            raise OCRError(f"HTTP {r.status_code}: {_err_message(r)}")
+            raise OCRError(redact(f"HTTP {r.status_code}: {_err_message(r)}", key))
         ids = []
         for it in r.json().get("data", []):
             mid = it.get("id") if isinstance(it, dict) else None
@@ -1242,9 +1467,12 @@ class HotkeyManager:
     """Global hotkeys through pynput (X11, Windows, macOS). Callbacks only call `emit`, which must hand
     the command to the GUI thread (a Qt signal); they never touch widgets themselves."""
 
-    def __init__(self, emit, backend=None):
+    PORTAL_WAIT = 4.0  # seconds apply() waits for the portal before reporting "waiting for the dialog"
+
+    def __init__(self, emit, backend=None, portal_bus=None):
         self.emit = emit
         self._backend = backend  # tests inject a fake with GlobalHotKeys(mapping)
+        self._portal_bus = portal_bus  # tests inject a fake D-Bus connection factory
         self._listener = None
         self._generation = 0
         self._lock = threading.Lock()
@@ -1272,12 +1500,12 @@ class HotkeyManager:
                 self.emit(action)
         return callback
 
-    def apply(self, hotkeys: dict):
-        """Register hotkeys. Returns (ok, message, level) with level in ok/info/warn/err."""
+    def apply(self, hotkeys: dict, wayland_mode: str = "auto"):
+        """Register hotkeys. Returns (ok, message, level) with level in ok/info/warn/err.
+        X11 / Windows / macOS: pynput. Wayland: the desktop portal where it exists, else manual binds."""
         self.stop()
         if is_wayland():
-            return False, ("Wayland: apps can't grab global keys. Bind the keys in your compositor "
-                           "using the lines below (they call --trigger)."), "info"
+            return self._apply_wayland(hotkeys, wayland_mode)
         mapping, owner, problems = {}, {}, []
         with self._lock:
             generation = self._generation
@@ -1323,6 +1551,56 @@ class HotkeyManager:
         note = " On macOS, allow Accessibility / Input Monitoring for this app if keys do nothing." if IS_MAC else ""
         return True, "Global hotkeys active." + note, "ok"
 
+    def _apply_wayland(self, hotkeys: dict, mode: str):
+        """Apps can't grab keys on Wayland. Hyprland keeps its compositor binds (unchanged behaviour, portal only
+        on request); everywhere else the GlobalShortcuts portal is used when the running portal offers it."""
+        manual = ("Wayland: apps can't grab global keys. Bind the keys in your compositor "
+                  "using the lines below (they call --trigger).")
+        if mode == "manual" or (mode == "auto" and detect_desktop() == "hyprland"):
+            return False, manual, "info"
+        import ocr_portal
+        shortcuts = {}
+        for action in HOTKEY_ORDER:
+            seq = hotkeys.get(action)
+            trig = ocr_portal.to_portal_trigger(seq) if seq else None
+            if seq and not trig:
+                return False, f"'{HOTKEY_LABELS[action]}': unsupported hotkey {seq}.", "err"
+            if trig:
+                shortcuts[action] = (HOTKEY_LABELS[action], trig)
+        if not shortcuts:
+            return True, "No hotkeys set.", "info"
+        ok, reason = ocr_portal.probe(self._portal_bus) if self._portal_bus else ocr_portal.probe()
+        if not ok:
+            return False, (f"Wayland: global shortcuts through the desktop portal aren't available ({reason}). "
+                           "Bind the keys manually using the lines below (they call --trigger)."), "info"
+        with self._lock:
+            generation = self._generation
+        cb = self._make_callback
+        client = ocr_portal.PortalShortcuts(shortcuts, lambda action: cb(action, generation)(),
+                                            **({"bus_factory": self._portal_bus} if self._portal_bus else {}))
+        client.start()
+        with self._lock:
+            self._listener = client
+        client.ready.wait(self.PORTAL_WAIT)
+        state, msg, level = client.status
+        if state == "pending":
+            return True, ("Waiting for you to confirm the global shortcuts in the desktop's dialog. "
+                          "If none appears, use the manual binds below."), "info"
+        if state == "err":
+            with self._lock:
+                self._listener = None
+            client.stop()
+            return False, f"{msg} Bind the keys manually using the lines below (they call --trigger).", level if level != "ok" else "err"
+        return True, msg, level
+
+    def portal_status(self):
+        """Latest (ok, message, level) of a portal session, or None when no portal session is active."""
+        listener = self._listener
+        if not hasattr(listener, "status"):
+            return None
+        state, msg, level = listener.status
+        return (state == "ok", msg, level) if state != "pending" else None
+
     def check_alive(self):
         """pynput reports startup failures from inside its thread. Returns an error text if the listener died."""
         listener = self._listener
@@ -1332,7 +1610,7 @@ class HotkeyManager:
             self._listener = None
         try:
             listener.join(0.1)  # re-raises the exception that killed the thread, if any
-            reason = "the listener stopped unexpectedly"
+            reason = getattr(listener, "failure", None) or "the listener stopped unexpectedly"
         except Exception as exc:  # the stored listener exception can be of any type
             reason = str(exc) or exc.__class__.__name__
         log.error("Hotkey listener died: %s", reason)
