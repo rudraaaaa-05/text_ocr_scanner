@@ -1,14 +1,114 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
+import socket
+import struct
 import threading
+import time
 from collections import deque
 from typing import Callable, Optional
+from urllib.parse import unquote, urlparse
 
-from ocr_core import APP_ID, HYPR_KEYS, split_seq
+from PIL import Image
+
+from ocr_core import APP_ID, HYPR_KEYS, CaptureError, split_seq
 
 log = logging.getLogger("ocr_scanner")
+
+
+##############################################################################################################
+# 1. compositor protocol probe
+##############################################################################################################
+
+# any one of these lets grim take screenshots
+SCREENCOPY_PROTOCOLS = ("zwlr_screencopy_manager_v1", "ext_image_copy_capture_manager_v1")
+# slurp draws its selection with a layer-shell surface
+LAYER_SHELL = "zwlr_layer_shell_v1"
+
+_DISPLAY_ID, _REGISTRY_ID, _CALLBACK_ID = 1, 2, 3
+_GET_REGISTRY, _SYNC = 1, 0          # wl_display requests
+_GLOBAL, _DONE, _ERROR = 0, 0, 0     # wl_registry.global, wl_callback.done, wl_display.error events
+
+
+def _socket_path(env) -> Optional[str]:
+    name = env.get("WAYLAND_DISPLAY") or ""
+    if not name:
+        return None
+    if os.path.isabs(name):
+        return name
+    runtime = env.get("XDG_RUNTIME_DIR")
+    return os.path.join(runtime, name) if runtime else None
+
+
+def _request(obj: int, opcode: int, payload: bytes) -> bytes:
+    return struct.pack("<II", obj, ((8 + len(payload)) << 16) | opcode) + payload
+
+
+def _read_exact(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("compositor closed the connection")
+        buf += chunk
+    return buf
+
+
+def list_globals(env=None, timeout: float = 2.0, sock=None) -> Optional[set]:
+    """Interface names the compositor advertises, or None if they could not be read."""
+    env = os.environ if env is None else env
+    own = sock is None
+    try:
+        if own:
+            path = _socket_path(env)
+            if not path:
+                return None
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(path)
+        sock.sendall(_request(_DISPLAY_ID, _GET_REGISTRY, struct.pack("<I", _REGISTRY_ID))
+                     + _request(_DISPLAY_ID, _SYNC, struct.pack("<I", _CALLBACK_ID)))
+        found = set()
+        while True:
+            obj, word = struct.unpack("<II", _read_exact(sock, 8))
+            size, opcode = word >> 16, word & 0xFFFF
+            if size < 8:
+                return None
+            body = _read_exact(sock, size - 8)
+            if obj == _REGISTRY_ID and opcode == _GLOBAL and len(body) >= 8:
+                (length,) = struct.unpack_from("<I", body, 4)
+                if length < 1 or 8 + length > len(body):
+                    return None
+                found.add(body[8:8 + length - 1].decode("utf-8", "replace"))
+            elif obj == _CALLBACK_ID and opcode == _DONE:
+                return found
+            elif obj == _DISPLAY_ID and opcode == _ERROR:
+                return None
+    except (OSError, struct.error):
+        return None
+    finally:
+        if own and sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def capabilities(env=None, globals_: Optional[set] = None) -> Optional[dict]:
+    """{'grim': bool, 'slurp': bool, 'globals': set} or None when the compositor could not be asked."""
+    names = list_globals(env) if globals_ is None else globals_
+    if names is None:
+        return None
+    return {"grim": any(p in names for p in SCREENCOPY_PROTOCOLS),
+            "slurp": LAYER_SHELL in names,
+            "globals": names}
+
+
+##############################################################################################################
+# 2. desktop portal: D-Bus transport and GlobalShortcuts
+##############################################################################################################
 
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -295,3 +395,93 @@ class PortalShortcuts(threading.Thread):
             except BusError:
                 pass  # the session ends with the connection anyway
         bus.close()
+
+
+##############################################################################################################
+# 3. portal screenshots
+##############################################################################################################
+
+SCREENSHOT_IFACE = "org.freedesktop.portal.Screenshot"
+RESPONSE_TIMEOUT = 60.0  # the first call may wait for the person to answer a permission dialog
+_portal_permission_granted = False
+
+
+def _unwrap(value):
+    """jeepney returns a{sv} values as (signature, value)."""
+    return value[1] if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str) else value
+
+
+def _path_from_uri(uri: str) -> str:
+    parsed = urlparse(uri)
+    if parsed.scheme not in ("file", ""):
+        raise CaptureError(f"The desktop returned a screenshot at an unsupported address ({parsed.scheme}:).")
+    return unquote(parsed.path if parsed.scheme else uri)
+
+
+def take_screenshot(bus_factory: Callable = JeepneyBus, timeout: float = RESPONSE_TIMEOUT,
+                    interactive: bool | None = None, app_id: str = APP_ID) -> Image.Image:
+    """One screenshot of the whole desktop as an RGB PIL image. Raises CaptureError with a readable reason."""
+    global _portal_permission_granted
+    try:
+        bus = bus_factory()
+    except BusError as exc:
+        raise CaptureError(f"Screenshot portal unavailable: {exc}") from None
+    path = None
+    try:
+        bus.subscribe(REQUEST_IFACE, "Response")
+        try:  # newer portals want host (non-Flatpak) apps to announce an app id first; older ones lack this
+            bus.call(REGISTRY_PATH, REGISTRY_IFACE, "Register", "sa{sv}", (app_id, {}), timeout=5.0)
+        except BusError as exc:
+            log.info("Portal app registration skipped: %s", exc)
+        ask_permission = (not _portal_permission_granted) if interactive is None else bool(interactive)
+        options = {"handle_token": ("s", "ocr" + secrets.token_hex(6)), "interactive": ("b", ask_permission)}
+        try:
+            reply = bus.call(PORTAL_PATH, SCREENSHOT_IFACE, "Screenshot", "sa{sv}", ("", options), timeout=10.0)
+        except BusError as exc:
+            raise CaptureError(_explain(exc)) from None
+        handle = reply[0] if reply else ""
+        deadline = time.monotonic() + timeout
+        response = None
+        while response is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CaptureError("The desktop did not answer the screenshot request in time "
+                                   "(is a permission dialog waiting for you?).")
+            sig = bus.next_signal(min(0.5, remaining))
+            if sig is None:
+                continue
+            sig_path, iface, member, body = sig
+            if iface == REQUEST_IFACE and member == "Response" and sig_path == handle and len(body) >= 2:
+                response = (body[0], body[1] if isinstance(body[1], dict) else {})
+        code, results = response
+        if code == 1:
+            raise CaptureError("The screenshot was cancelled in the desktop's dialog.")
+        if code != 0:
+            raise CaptureError("The desktop refused the screenshot (response %s). Allow this app to take "
+                               "screenshots in your desktop's privacy / app permission settings." % code)
+        uri = _unwrap(results.get("uri"))
+        if not isinstance(uri, str) or not uri:
+            raise CaptureError("The desktop portal answered without a screenshot file.")
+        _portal_permission_granted = True
+        path = _path_from_uri(uri)
+        try:
+            img = Image.open(path)
+            img.load()
+        except (OSError, ValueError) as exc:
+            raise CaptureError(f"Could not read the portal's screenshot file: {exc}") from None
+        return img.convert("RGB")
+    finally:
+        bus.close()
+        if path:  # the portal wrote this file for us; recording would otherwise fill the disk
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _explain(exc: BusError) -> str:
+    if exc.name in ("org.freedesktop.DBus.Error.ServiceUnknown", "org.freedesktop.DBus.Error.NameHasNoOwner",
+                    "org.freedesktop.DBus.Error.UnknownMethod", "org.freedesktop.DBus.Error.UnknownInterface"):
+        return ("This desktop has no screenshot portal. Install xdg-desktop-portal plus the backend for your "
+                "desktop (xdg-desktop-portal-gnome or xdg-desktop-portal-kde).")
+    return f"The screenshot portal failed: {exc}"

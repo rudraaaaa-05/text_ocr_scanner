@@ -1,24 +1,705 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
+import secrets
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 from ocr_core import (
-    APP_NAME, IS_LINUX, IS_WINDOWS, VERSION, CaptureError, Capturer, Config, OCRClient, OCRError, OutputError,
-    Recorder, ScanService, SessionOutput, TextSink, HotkeyManager, describe_region, detect_session, log,
-    setup_logging,
+    APP_ID, APP_NAME, IS_LINUX, IS_WINDOWS, VALID_COMMANDS, VERSION, CaptureError, Capturer, Config, OCRClient,
+    OCRError, OutputError, Recorder, ScanService, SessionOutput, TextSink, HotkeyManager, config_dir,
+    describe_region, detect_session, log, setup_logging,
 )
-from ocr_ipc import (
-    GUI_SCRIPT, IPCError, IPCServer, InstanceLock, daemon_running, request, spawn_detached, start_daemon,
-)
+
+
+##############################################################################################################
+# 1. IPC
+##############################################################################################################
+
+# the commands that existed before the daemon split (VALID_COMMANDS) plus the ones the daemon adds
+EXTRA_COMMANDS = ("resume", "status", "events", "ping", "scan_region", "reload_config", "select_ack", "shutdown")
+ALL_COMMANDS = tuple(VALID_COMMANDS) + EXTRA_COMMANDS
+# what `--trigger` accepts: the old set, plus the ones that make sense from a shell
+TRIGGER_COMMANDS = tuple(VALID_COMMANDS) + ("resume", "status", "shutdown")
+
+MAX_LINE = 64 * 1024
+SERVER_TIMEOUT = 5.0
+MAX_CONNECTIONS = 16
+
+DAEMON_SCRIPT = str(Path(__file__).resolve().with_name("ocr_daemon.py"))
+GUI_SCRIPT = str(Path(__file__).resolve().with_name("ocr_scanner.py"))
+
+
+class IPCError(Exception):
+    """Raised by command handlers; becomes a structured error reply."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+# endpoint
+
+def ipc_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    folder = Path(runtime) if runtime and os.path.isdir(runtime) else config_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    return str(folder / f"{APP_ID}.sock")
+
+
+def endpoint_file() -> Path:
+    return config_dir() / "ipc-endpoint.json"
+
+
+def _read_endpoint():
+    try:
+        data = json.loads(endpoint_file().read_text(encoding="utf-8"))
+        return int(data["port"]), str(data["token"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _connect(timeout: float):
+    """(socket, token). Raises OSError when nothing is listening."""
+    if IS_WINDOWS:
+        ep = _read_endpoint()
+        if ep is None:
+            raise ConnectionRefusedError("no endpoint file")
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(("127.0.0.1", ep[0]))
+        except OSError:
+            s.close()
+            raise
+        return s, ep[1]
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(ipc_path())
+    except OSError:
+        s.close()
+        raise
+    return s, ""
+
+
+def _read_line(conn: socket.socket, limit: int = MAX_LINE) -> bytes:
+    """Reads up to the first newline. Raises ValueError when the line is too long."""
+    buf = b""
+    while b"\n" not in buf:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > limit:
+            raise ValueError("request too large")
+    return buf.split(b"\n", 1)[0]
+
+
+# client
+
+def request(cmd: str, args: dict | None = None, timeout: float = 3.0):
+    """Send one command to the daemon. Returns the parsed reply dict, or None if it is not running."""
+    try:
+        s, token = _connect(timeout)
+    except OSError:
+        return None
+    payload = {"cmd": cmd, "args": args or {}}
+    if token:
+        payload["token"] = token
+    try:
+        with s:
+            s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            line = _read_line(s, MAX_LINE * 16)
+    except (OSError, ValueError):
+        return None
+    try:
+        reply = json.loads(line.decode("utf-8", "ignore"))
+    except ValueError:
+        return {"ok": False, "error": {"code": "bad_reply", "message": "The daemon sent an unreadable reply."}}
+    if not isinstance(reply, dict):
+        return {"ok": False, "error": {"code": "bad_reply", "message": "The daemon sent an unreadable reply."}}
+    return reply
+
+
+def send_command(cmd: str, timeout: float = 1.5):
+    """Backwards compatible helper: the reply as text ("ok" / "error: ..."), or None if not running."""
+    reply = request(cmd, timeout=timeout)
+    if reply is None:
+        return None
+    if reply.get("ok"):
+        return "ok"
+    err = reply.get("error") or {}
+    return f"error: {err.get('message', 'failed')}"
+
+
+def daemon_running(timeout: float = 1.0) -> bool:
+    reply = request("ping", timeout=timeout)
+    return bool(reply and reply.get("ok"))
+
+
+# server
+
+class IPCServer(threading.Thread):
+    """Accepts local connections and hands validated commands to `handler(cmd, args) -> data | None`.
+
+    The handler may raise IPCError for expected failures; any other exception is logged and reported as
+    code "internal" so one bad request can never kill the daemon.
+    """
+
+    def __init__(self, handler):
+        super().__init__(daemon=True, name="ipc-server")
+        self.handler = handler
+        self.sock = None
+        self.path = None
+        self.token = ""
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def bind(self) -> bool:
+        try:
+            if IS_WINDOWS:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("127.0.0.1", 0))
+                self.token = secrets.token_hex(24)
+                ep = endpoint_file()
+                ep.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(str(ep), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"port": s.getsockname()[1], "token": self.token, "pid": os.getpid()}, fh)
+                self.path = str(ep)
+            else:
+                self.path = ipc_path()
+                if os.path.exists(self.path):
+                    if daemon_running():
+                        return False  # a live instance owns it
+                    os.unlink(self.path)
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                old = os.umask(0o177)  # the socket is created 0600 from the start
+                try:
+                    s.bind(self.path)
+                finally:
+                    os.umask(old)
+                os.chmod(self.path, 0o600)
+            s.listen(8)
+            self.sock = s
+            return True
+        except OSError as exc:
+            log.error("Could not open the IPC endpoint: %s", exc)
+            return False
+
+    def run(self):
+        while self.sock is not None:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            if not self._slots.acquire(blocking=False):
+                conn.close()  # too many simultaneous connections: refuse instead of piling up threads
+                continue
+            threading.Thread(target=self._serve, args=(conn,), daemon=True, name="ipc-conn").start()
+
+    # a peer from another user is never served (Linux). Windows relies on the token.
+    @staticmethod
+    def _peer_ok(conn: socket.socket) -> bool:
+        if IS_WINDOWS or not hasattr(socket, "SO_PEERCRED"):
+            return True
+        try:
+            raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            _pid, uid, _gid = struct.unpack("3i", raw)
+        except (OSError, struct.error):
+            return False
+        return uid == os.getuid()
+
+    def _serve(self, conn: socket.socket):
+        try:
+            with conn:
+                conn.settimeout(SERVER_TIMEOUT)
+                if not self._peer_ok(conn):
+                    return
+                try:
+                    line = _read_line(conn)
+                except ValueError:
+                    self._reply(conn, False, error=("request_too_large", "The request is too large."), legacy=False)
+                    return
+                except OSError:
+                    return  # timeout or reset: nothing sensible to answer
+                self._dispatch(conn, line)
+        finally:
+            self._slots.release()
+
+    def _dispatch(self, conn, line: bytes):
+        text = line.decode("utf-8", "ignore").strip()
+        legacy = not text.startswith("{")
+        if legacy:
+            parts = text.split()
+            cmd, args, token = (parts[0] if parts else ""), {}, None
+            if IS_WINDOWS:  # a bare text command has no token, so it cannot be authenticated
+                self._reply(conn, False, error=("unauthorized", "A token is required."), legacy=True)
+                return
+        else:
+            try:
+                msg = json.loads(text)
+            except ValueError:
+                self._reply(conn, False, error=("bad_request", "The request is not valid JSON."), legacy=False)
+                return
+            if not isinstance(msg, dict):
+                self._reply(conn, False, error=("bad_request", "The request must be a JSON object."), legacy=False)
+                return
+            cmd, args, token = msg.get("cmd"), msg.get("args", {}), msg.get("token")
+            if not isinstance(args, dict):
+                self._reply(conn, False, error=("bad_request", "'args' must be an object."), legacy=False)
+                return
+        if IS_WINDOWS and not (isinstance(token, str) and hmac.compare_digest(token, self.token)):
+            self._reply(conn, False, error=("unauthorized", "Missing or wrong token."), legacy=legacy)
+            return
+        if not isinstance(cmd, str) or cmd not in ALL_COMMANDS:
+            self._reply(conn, False, error=("unknown_command", f"Unknown command: {str(cmd)[:40]!r}."), legacy=legacy)
+            return
+        try:
+            data = self.handler(cmd, args)
+        except IPCError as exc:
+            self._reply(conn, False, error=(exc.code, exc.message), legacy=legacy)
+            return
+        except Exception as exc:  # boundary of the request thread: report, keep the daemon alive
+            log.exception("IPC command %r failed", cmd)
+            self._reply(conn, False, error=("internal", f"{exc.__class__.__name__}: {exc}"), legacy=legacy)
+            return
+        self._reply(conn, True, data=data, legacy=legacy)
+
+    @staticmethod
+    def _reply(conn, ok: bool, data=None, error=None, legacy: bool = False):
+        if legacy:
+            out = "ok\n" if ok else f"error: {error[1]}\n"
+        else:
+            body = {"ok": True, "data": data} if ok else {"ok": False, "error": {"code": error[0], "message": error[1]}}
+            out = json.dumps(body, ensure_ascii=False) + "\n"
+        try:
+            conn.sendall(out.encode("utf-8"))
+        except OSError:
+            pass
+
+    def close(self):
+        s, self.sock = self.sock, None
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+        if self.path and os.path.exists(self.path):
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+
+# single instance
+
+class InstanceLock:
+    """An OS file lock held for the life of the process (released automatically if it crashes)."""
+
+    def __init__(self, name: str):
+        self.path = config_dir() / f"{name}.lock"
+        self._fh = None
+
+    def acquire(self) -> bool:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(self.path, "a+")
+        except OSError as exc:
+            log.error("Cannot open the lock file %s: %s", self.path, exc)
+            return False
+        try:
+            if IS_WINDOWS:
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        self._fh = fh
+        return True
+
+    def release(self):
+        fh, self._fh = self._fh, None
+        if fh is None:
+            return
+        try:
+            if IS_WINDOWS:
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
+
+
+# starting processes
+
+def spawn_detached(argv: list):
+    """Start a process that outlives the caller (no console, no controlling terminal)."""
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+    if IS_WINDOWS:
+        kw["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x8)
+                               | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+                               | getattr(subprocess, "CREATE_NO_WINDOW", 0x8000000))
+    else:
+        kw["start_new_session"] = True
+    return subprocess.Popen(argv, **kw)
+
+
+def daemon_argv(*extra: str) -> list:
+    return [sys.executable, DAEMON_SCRIPT, *extra]
+
+
+def start_daemon(wait: float = 10.0, launch_gui: bool = False):
+    """Make sure a daemon is running. Returns (ok, message). Never starts a second one: the daemon itself
+    refuses to run twice, so a race between two callers is harmless.
+
+    ``launch_gui`` is used by the command-line launcher. The GUI itself leaves this
+    disabled so opening the window never creates another GUI process.
+    """
+    if daemon_running():
+        if launch_gui:
+            reply = request("show", {"visible": True})
+            if reply is None or not reply.get("ok"):
+                return False, "The daemon is running, but the GUI could not be started."
+            return True, "The daemon is already running; GUI requested."
+        return True, "The daemon is already running."
+    try:
+        spawn_detached(daemon_argv("run"))
+    except OSError as exc:
+        return False, f"Could not start the {APP_NAME} daemon: {exc.strerror or exc}"
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if daemon_running():
+            if not launch_gui:
+                return True, "The daemon was started."
+            reply = request("show")
+            if reply is None or not reply.get("ok"):
+                return False, "The daemon started, but the GUI could not be started."
+            return True, "The daemon and tray GUI were started."
+        time.sleep(0.2)
+    return False, f"The {APP_NAME} daemon did not answer within {wait:.0f} s. See the daemon log in {config_dir()}."
+
+
+# command line
+
+def cli_trigger(argv: list) -> int:
+    """`--trigger <command>`: same exit codes as before (0 ok, 1 not running / failed, 2 bad usage)."""
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd not in TRIGGER_COMMANDS:
+        sys.stderr.write(f"usage: ocr_scanner.py --trigger {{{'|'.join(TRIGGER_COMMANDS)}}}\n")
+        return 2
+    reply = request(cmd)
+    if reply is None:
+        sys.stderr.write(f"The {APP_NAME} daemon is not running. Start it first:  python ocr_daemon.py start\n")
+        return 1
+    if not reply.get("ok"):
+        sys.stderr.write(f"{(reply.get('error') or {}).get('message', 'The command failed.')}\n")
+        return 1
+    if cmd == "status":
+        print(json.dumps(reply.get("data"), indent=2, ensure_ascii=False))
+    return 0
+
+
+##############################################################################################################
+# 2. GUI link (polls the daemon for events)
+##############################################################################################################
+
+POLL_INTERVAL = 0.5
+
+
+class DaemonLink(threading.Thread):
+
+    def __init__(self, on_update, on_connection):
+        super().__init__(daemon=True, name="daemon-link")
+        self.on_update, self.on_connection = on_update, on_connection
+        self.stop_evt = threading.Event()
+        self.last = 0
+        self.connected = None   # unknown until the first poll
+        self._first = True
+
+    def stop(self):
+        self.stop_evt.set()
+
+    def run(self):
+        while not self.stop_evt.is_set():
+            reply = request("events", {"since": self.last}, timeout=2.0)
+            ok = bool(reply and reply.get("ok"))
+            if ok != self.connected:
+                self.connected = ok
+                if not ok:
+                    self._first = True
+                self._safe(self.on_connection, ok)
+            if ok:
+                data = reply["data"]
+                if data["last"] < self.last:  # the daemon restarted: its counters started over
+                    self.last = 0
+                    self._first = True
+                    continue
+                self.last = data["last"]
+                replay, self._first = self._first, False
+                self._safe(self.on_update, data, replay)
+            self.stop_evt.wait(POLL_INTERVAL)
+
+    @staticmethod
+    def _safe(fn, *args):
+        try:
+            fn(*args)
+        except Exception:  # a GUI callback must never kill the poller thread
+            log.exception("Daemon link callback failed")
+
+
+##############################################################################################################
+# 3. autostart (systemd user units / Windows Run key)
+##############################################################################################################
+
+UNIT_NAME = f"{APP_ID}.service"
+GUI_UNIT_NAME = f"{APP_ID}-gui.service"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = "OCRScanner"
+# the graphical session's variables the daemon needs for grim/slurp, mss and pynput
+SESSION_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
+                "HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_DESKTOP",
+                "DESKTOP_SESSION", "SWAYSOCK")
+
+
+# systemd (Linux)
+
+def unit_dir() -> Path:
+    base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    return base / "systemd" / "user"
+
+
+def unit_path() -> Path:
+    return unit_dir() / UNIT_NAME
+
+
+def gui_unit_path() -> Path:
+    return unit_dir() / GUI_UNIT_NAME
+
+
+def _systemd_quote(s: str) -> str:
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+    return f'"{s}"'
+
+
+def render_unit(python: str, script: str) -> str:
+    return (
+        "[Unit]\n"
+        f"Description={APP_NAME} background daemon\n"
+        "After=graphical-session.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={_systemd_quote(python)} {_systemd_quote(script)} run\n"
+        "Restart=on-failure\n"
+        "RestartSec=3\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=graphical-session.target hyprland-session.target\n"
+    )
+
+
+def render_gui_unit(python: str, script: str, daemon_unit: str = UNIT_NAME) -> str:
+    return (
+        "[Unit]\n"
+        f"Description={APP_NAME} tray GUI\n"
+        f"Requires={daemon_unit}\n"
+        f"After={daemon_unit} graphical-session.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={_systemd_quote(python)} {_systemd_quote(script)} --hidden\n"
+        "Restart=always\n"
+        "RestartSec=3\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=graphical-session.target hyprland-session.target\n"
+    )
+
+
+def _run(cmd: list):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        return 127, "systemctl was not found. This needs a systemd based Linux."
+    except subprocess.SubprocessError as exc:
+        return 1, str(exc)
+    return r.returncode, (r.stdout or r.stderr or "").strip()
+
+
+def systemd_enable(run=_run, python: str | None = None, script: str | None = None):
+    """Install + enable + start the user unit. Returns (ok, message)."""
+    path = unit_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        py = python or sys.executable
+        daemon_script = script or DAEMON_SCRIPT
+        path.write_text(render_unit(py, daemon_script), encoding="utf-8")
+        gui_unit_path().write_text(render_gui_unit(py, GUI_SCRIPT), encoding="utf-8")
+    except OSError as exc:
+        return False, f"Could not write {path}: {exc.strerror or exc}"
+    rc, out = run(["systemctl", "--user", "daemon-reload"])
+    if rc != 0:
+        return False, f"systemctl --user daemon-reload failed: {out}"
+    present = [v for v in SESSION_VARS if os.environ.get(v)]
+    if present:  # user services do not inherit the session environment by default
+        run(["systemctl", "--user", "import-environment", *present])
+    for unit in (UNIT_NAME, GUI_UNIT_NAME):
+        run(["systemctl", "--user", "disable", unit])
+    for unit in (UNIT_NAME, GUI_UNIT_NAME):
+        rc, out = run(["systemctl", "--user", "enable", "--now", unit])
+        if rc != 0:
+            return False, f"systemctl --user enable failed for {unit}: {out}"
+        rc, out = run(["systemctl", "--user", "restart", unit])
+        if rc != 0:
+            return False, f"systemctl --user restart failed for {unit}: {out}"
+    return True, f"Enabled and started {UNIT_NAME}. The daemon and tray GUI now start at every login."
+
+
+def systemd_disable(run=_run):
+    failures = []
+    for unit in (GUI_UNIT_NAME, UNIT_NAME):
+        rc, out = run(["systemctl", "--user", "disable", "--now", unit])
+        if rc != 0 and "not loaded" not in out.lower() and "does not exist" not in out.lower():
+            failures.append(f"{unit}: {out}")
+    for path in (gui_unit_path(), unit_path()):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return False, f"Could not remove {path}: {exc.strerror or exc}"
+    run(["systemctl", "--user", "daemon-reload"])
+    if failures:
+        return False, f"systemctl --user disable failed: {'; '.join(failures)}"
+    return True, f"Disabled {UNIT_NAME} and stopped it."
+
+
+def systemd_status(run=_run) -> str:
+    if not unit_path().exists():
+        return "autostart: not enabled (no user unit installed)"
+    _, enabled = run(["systemctl", "--user", "is-enabled", UNIT_NAME])
+    _, active = run(["systemctl", "--user", "is-active", UNIT_NAME])
+    _, gui_active = run(["systemctl", "--user", "is-active", GUI_UNIT_NAME])
+    return (f"autostart: units installed, {enabled or 'unknown'}; daemon is {active or 'unknown'}; "
+            f"tray GUI is {gui_active or 'unknown'}")
+
+
+def systemd_control(action: str, run=_run):
+    rc, out = run(["systemctl", "--user", action, UNIT_NAME])
+    return rc == 0, out or f"systemctl --user {action}: done"
+
+
+# Windows startup entry
+
+def windows_command(python: str | None = None, script: str | None = None) -> str:
+    exe = python or sys.executable
+    pyw = Path(exe).with_name("pythonw.exe")
+    if pyw.exists():  # pythonw has no console window
+        exe = str(pyw)
+    return f'"{exe}" "{script or DAEMON_SCRIPT}" run'
+
+
+def _winreg():
+    import winreg
+    return winreg
+
+
+def windows_enable(reg=None, start=start_daemon):
+    reg = reg or _winreg()
+    try:
+        with reg.CreateKey(reg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            reg.SetValueEx(key, RUN_VALUE, 0, reg.REG_SZ, windows_command())
+    except OSError as exc:
+        return False, f"Could not write the startup entry: {exc.strerror or exc}"
+    ok, msg = start()
+    return True, "Autostart enabled. " + msg if ok else f"Autostart enabled, but the daemon could not be started now: {msg}"
+
+
+def windows_disable(reg=None):
+    reg = reg or _winreg()
+    try:
+        with reg.OpenKey(reg.HKEY_CURRENT_USER, RUN_KEY, 0, reg.KEY_SET_VALUE) as key:
+            reg.DeleteValue(key, RUN_VALUE)
+    except FileNotFoundError:
+        pass  # nothing to remove
+    except OSError as exc:
+        return False, f"Could not remove the startup entry: {exc.strerror or exc}"
+    return True, "Autostart disabled. A running daemon keeps running; stop it with: python ocr_daemon.py stop"
+
+
+def windows_status(reg=None) -> str:
+    reg = reg or _winreg()
+    try:
+        with reg.OpenKey(reg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            value, _ = reg.QueryValueEx(key, RUN_VALUE)
+        return f"autostart: enabled ({value})"
+    except OSError:
+        return "autostart: not enabled"
+
+
+# command line entry points
+
+def cli_autostart(what: str) -> int:
+    if IS_WINDOWS:
+        if what == "status":
+            print(windows_status())
+            return 0
+        ok, msg = windows_enable() if what == "enable" else windows_disable()
+    elif IS_LINUX:
+        if what == "status":
+            print(systemd_status())
+            return 0
+        if not shutil.which("systemctl"):
+            print("systemctl was not found. Autostart needs a systemd based Linux.")
+            return 1
+        ok, msg = systemd_enable() if what == "enable" else systemd_disable()
+    else:
+        print("Autostart is supported on Linux and Windows only.")
+        return 1
+    print(msg)
+    return 0 if ok else 1
+
+
+def cli_service(what: str) -> int:
+    if not IS_LINUX:
+        print("The systemd service commands are Linux only. On Windows use: python ocr_daemon.py start|stop|status")
+        return 1
+    if what == "status":
+        print(systemd_status())
+        rc, out = _run(["systemctl", "--user", "status", "--no-pager", UNIT_NAME])
+        print(out)
+        return 0 if rc == 0 else 3
+    ok, msg = systemd_control(what)
+    print(msg)
+    return 0 if ok else 1
+
+
+##############################################################################################################
+# 4. the daemon
+##############################################################################################################
 
 EVENT_BUFFER = 500
 GUI_SEEN_WINDOW = 4.0        # the GUI polls every ~0.5 s; silent for longer than this means it is gone
@@ -318,19 +999,22 @@ class Daemon:
                 "session_error": self.startup_error or None,
                 "hotkeys": {"ok": ok, "message": msg, "level": level, "running": self.hotkeys.running}}
 
-    def cmd_show(self, _a):
+    def cmd_show(self, args):
         if self.gui_connected():
             self.events.push("show")
         else:
-            self._spawn_gui()
+            self._spawn_gui(hidden=not bool(args.get("visible")))
         return None
 
-    def _spawn_gui(self):
+    def _spawn_gui(self, hidden: bool = True):
         if time.monotonic() - self._gui_spawned < SELECT_TTL_SPAWN:
             return  # one was just started and is still coming up
         self._gui_spawned = time.monotonic()
         try:
-            spawn_detached([sys.executable, GUI_SCRIPT, "--hidden"])
+            argv = [sys.executable, GUI_SCRIPT]
+            if hidden:
+                argv.append("--hidden")
+            spawn_detached(argv)
         except OSError as exc:
             raise IPCError("gui_unavailable", f"Could not start the GUI: {exc.strerror or exc}") from exc
 
@@ -471,7 +1155,7 @@ class Daemon:
         """Pick a NEW region and scan it once (the region is not stored)."""
         self._check_ready(need_region=True)
         self._claim("region")
-        if self.capturer.wayland:  # slurp needs no GUI
+        if self.capturer.uses_slurp:  # slurp needs no GUI; the portal backend uses the GUI's Qt selector
             threading.Thread(target=self._wayland_region, daemon=True, name="region-wayland").start()
             return {"started": True, "selector": "slurp"}
         try:
@@ -615,10 +1299,9 @@ def main(argv=None) -> int:
             return 1
         print(_status_text(reply["data"]))
         return 0
-    import ocr_autostart
     if action == "autostart":
-        return ocr_autostart.cli_autostart(ns.what)
-    return ocr_autostart.cli_service(ns.what)
+        return cli_autostart(ns.what)
+    return cli_service(ns.what)
 
 
 if __name__ == "__main__":

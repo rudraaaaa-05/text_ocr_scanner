@@ -14,8 +14,7 @@ from pathlib import Path
 
 from ocr_core import *  # noqa: F401,F403  (Qt-free core: config, capture, OCR providers, constants)
 from ocr_core import _merge, _is_int  # noqa: F401
-from ocr_ipc import InstanceLock, cli_trigger, request, send_command, start_daemon  # noqa: F401
-from ocr_client import DaemonLink
+from ocr_daemon import DaemonLink, InstanceLock, cli_trigger, request, send_command, start_daemon  # noqa: F401
 
 if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "--trigger":
     sys.exit(cli_trigger(sys.argv[1:]))
@@ -195,8 +194,11 @@ class RegionOverlay(QWidget):
 class OverlayManager(QObject):
     finished = Signal(object, str)  # (region dict, PIL image) or None, and an error text ("" if none)
 
-    def __init__(self, shots: list, screens: list):
+    def __init__(self, shots: list, screens: list, portal: bool = False):
+        """portal=True: `shots` are one piece per Qt screen, in the same order as `screens`, cut from a
+        portal screenshot. The regions picked are then stored as type "portal" (desktop screenshot pixels)."""
         super().__init__()
+        self.portal = portal
         self.shots = shots
         self.layout = monitor_layout([m for m, _ in shots])
         self.overlays = []
@@ -206,7 +208,8 @@ class OverlayManager(QObject):
         for qs in screens:
             g = qs.geometry()
             geoms.append((g.x(), g.y(), g.width(), g.height(), qs.devicePixelRatio()))
-        mapping = match_screens(geoms, [m for m, _ in shots])
+        mapping = ({i: i for i in range(min(len(screens), len(shots)))} if portal
+                   else match_screens(geoms, [m for m, _ in shots]))
         self.unmatched = [i for i in range(len(screens)) if i not in mapping]
         for si, mi in mapping.items():
             ov = RegionOverlay(mi, screens[si], shots[mi][1])
@@ -229,7 +232,10 @@ class OverlayManager(QObject):
         except ValueError as exc:
             self._finish(None, f"Invalid selection ({exc}).")
             return
-        region["layout"] = self.layout  # lets us detect a changed monitor setup later
+        if self.portal:
+            region["type"] = "portal"  # no layout check: the daemon has no screen list to compare with
+        else:
+            region["layout"] = self.layout  # lets us detect a changed monitor setup later
         self._finish((region, img.crop(crop_box)), "")
 
     def _close_overlays(self):
@@ -1446,7 +1452,9 @@ class MainWindow(QMainWindow):
         """Screenshot / slurp work happens here so the GUI stays responsive."""
         time.sleep(delay)
         try:
-            if self.capturer.wayland:
+            if self.capturer.portal:
+                self.bus.post("shots_ready", self.capturer.grab_desktop())
+            elif self.capturer.wayland:
                 region = self.capturer.select_region_wayland()
                 img = self.capturer.grab_region(region) if region else None
                 self.bus.post("select_done", (region, img, None))
@@ -1462,7 +1470,13 @@ class MainWindow(QMainWindow):
         if not self._selecting or self._closing:
             return
         try:
-            mgr = OverlayManager(shots, QGuiApplication.screens())
+            if self.capturer.portal:  # `shots` is one whole-desktop image: cut it up per Qt screen
+                screens = QGuiApplication.screens()
+                shots = split_desktop_image(shots, [(sc.geometry().x(), sc.geometry().y(), sc.geometry().width(),
+                                                     sc.geometry().height()) for sc in screens])
+                mgr = OverlayManager(shots, screens, portal=True)
+            else:
+                mgr = OverlayManager(shots, QGuiApplication.screens())
             if mgr.unmatched:
                 self.add_log("warn", f"{len(mgr.unmatched)} screen(s) could not be matched to a capture monitor "
                                      "and cannot be used for selection.")
@@ -1591,7 +1605,14 @@ def main() -> int:
     hidden = "--hidden" in sys.argv[1:]
     lock = InstanceLock("gui")
     if not lock.acquire():
-        send_command("show")  # the running window comes forward
+        if send_command("show") is None:
+            # A tray GUI can outlive a daemon crash. Restart the daemon so its
+            # event stream can deliver the show request to that GUI.
+            ok, _msg = start_daemon()
+            if ok:
+                for _ in range(10):
+                    send_command("show")
+                    time.sleep(0.2)
         print(f"{APP_NAME} is already running; brought its window forward.")
         return 0
 
@@ -1611,6 +1632,9 @@ def main() -> int:
     bus = Bus()
     win = MainWindow(cfg, bus)
     app.aboutToQuit.connect(win.shutdown)
+    if hidden and win.tray is None:
+        hidden = False
+        win.add_log("warn", "No system tray is available. Install a tray host or keep the window open.")
     if hidden:
         # Autostart keeps only the tray icon visible; the window opens on demand.
         win.hide()

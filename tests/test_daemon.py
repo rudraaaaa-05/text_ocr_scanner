@@ -248,6 +248,8 @@ class InstanceLockTests(IsolatedEnv):
 
 class FakeCapturer:
     wayland = False
+    portal = False
+    uses_slurp = False
     backend = "fake"
 
     def __init__(self):

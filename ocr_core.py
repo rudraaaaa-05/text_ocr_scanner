@@ -663,6 +663,15 @@ def region_problem(region, wayland: bool, monitors=None):
         if int(m.group(3)) <= 0 or int(m.group(4)) <= 0:
             return "The stored region is empty (zero size). Select a new region."
         return None
+    if kind == "portal":
+        if not wayland:
+            return "The stored region was selected on Wayland and cannot be used here. Select a new region."
+        vals = [region.get(k) for k in ("left", "top", "width", "height")]
+        if not all(_is_int(v) for v in vals) or vals[0] < 0 or vals[1] < 0:
+            return "The stored region is malformed. Select a new region."
+        if vals[2] <= 0 or vals[3] <= 0:
+            return "The stored region is empty (zero size). Select a new region."
+        return None
     if kind == "mss":
         if wayland:
             return "The stored region was not selected on Wayland and cannot be used here. Select a new region."
@@ -699,20 +708,99 @@ def _mss_module():
         return mss, (OSError, ValueError)
 
 
+def split_desktop_image(img, geoms):
+    """Cut one whole-desktop screenshot into one piece per screen.
+
+    geoms: [(x, y, w, h)] screen rectangles in the toolkit's logical pixels, any origin. The screenshot is
+    assumed to span their bounding box at a uniform scale (true for the XDG screenshot portal, also with
+    fractional scaling). Returns [(monitor dict in screenshot pixels, cropped PIL image)] in the same order.
+    The monitor dicts use the same left/top/width/height keys as mss, so the selector code can treat them alike.
+    """
+    if not geoms:
+        raise CaptureError("No screens were found to place the screenshot on.")
+    bx, by = min(g[0] for g in geoms), min(g[1] for g in geoms)
+    bw = max(g[0] + g[2] for g in geoms) - bx
+    bh = max(g[1] + g[3] for g in geoms) - by
+    if bw <= 0 or bh <= 0:
+        raise CaptureError("The screens report no size.")
+    fx, fy = img.size[0] / bw, img.size[1] / bh
+    out = []
+    for x, y, w, h in geoms:
+        left, top = max(0, round((x - bx) * fx)), max(0, round((y - by) * fy))
+        right, bottom = min(img.size[0], round((x + w - bx) * fx)), min(img.size[1], round((y + h - by) * fy))
+        if right - left < 1 or bottom - top < 1:
+            raise CaptureError("A screen could not be located inside the desktop screenshot.")
+        out.append(({"left": left, "top": top, "width": right - left, "height": bottom - top},
+                    img.crop((left, top, right, bottom))))
+    return out
+
+
+# desktops whose compositor has no wlroots protocols; used only when the compositor cannot be asked directly
+PORTAL_DESKTOPS = ("gnome", "kde", "budgie", "pantheon", "deepin", "cinnamon", "unknown")
+
+
 class Capturer:
-    """Wayland (Hyprland, sway, ...) uses grim + slurp. Everything else uses mss + a Qt selector."""
+    """Three capture backends:
+
+    * grim + slurp, on wlroots-style Wayland compositors (Hyprland, sway, ...)
+    * the XDG screenshot portal + the built-in Qt selector, on other Wayland compositors (GNOME, KDE, ...)
+    * mss + the built-in Qt selector, on X11 / Windows / macOS
+
+    On Wayland the compositor is asked which protocols it offers. Set OCR_CAPTURE=grim or OCR_CAPTURE=portal
+    to override the choice.
+    """
 
     def __init__(self):
         self.wayland = is_wayland()
         self.hypr = is_hyprland()
         self._slurp = None
         self._slurp_lock = threading.Lock()
+        self.portal, self.portal_reason = self._choose_portal()
+
+    def _choose_portal(self):
+        """(use_portal, why). Portal capture only ever applies on Wayland."""
+        if not self.wayland:
+            return False, ""
+        forced = os.environ.get("OCR_CAPTURE", "").strip().lower()
+        if forced in ("grim", "portal"):
+            return forced == "portal", f"OCR_CAPTURE={forced}"
+        if self.hypr:
+            return False, "Hyprland"
+        desktop = detect_desktop()
+        if desktop in PORTAL_DESKTOPS:
+            return True, f"{desktop} desktop"
+        try:
+            import ocr_wayland
+            caps = ocr_wayland.capabilities()
+        except Exception:  # the probe must never stop the app from starting
+            log.exception("Wayland protocol probe failed")
+            caps = None
+        if caps is not None:
+            if caps["grim"] and caps["slurp"]:
+                return False, "the compositor supports screen capture and layer-shell"
+            missing = [n for n, ok in (("a screen-copy protocol (for grim)", caps["grim"]),
+                                       ("zwlr_layer_shell_v1 (for slurp)", caps["slurp"])) if not ok]
+            return True, "the compositor lacks " + " and ".join(missing)
+        if desktop in PORTAL_DESKTOPS:
+            return True, f"{desktop} desktop (compositor could not be asked)"
+        return False, "compositor could not be asked; assuming wlroots"
+
+    @property
+    def uses_slurp(self) -> bool:
+        """True when region selection is done by slurp (no GUI needed)."""
+        return self.wayland and not self.portal
 
     @property
     def backend(self) -> str:
+        if self.portal:
+            return "desktop screenshot portal + built-in region selector (Wayland)"
         return "grim + slurp (Wayland)" if self.wayland else "mss + built-in region selector"
 
     def problem(self, need_region: bool = False):
+        if self.portal:
+            if importlib.util.find_spec("jeepney") is None:
+                return "The 'jeepney' package is missing (needed for the screenshot portal): pip install jeepney"
+            return None
         if self.wayland:
             if not shutil.which("grim"):
                 return "grim is not installed (Arch: sudo pacman -S grim slurp)."
@@ -737,6 +825,11 @@ class Capturer:
     def region_error(self, region):
         """None if `region` can be captured right now, else the reason."""
         if self.wayland:
+            kind = region.get("type") if isinstance(region, dict) else None
+            if self.portal and kind == "geom":
+                return "The stored region was selected with grim/slurp. Select a new region."
+            if not self.portal and kind == "portal":
+                return "The stored region was selected with the screenshot portal. Select a new region."
             return region_problem(region, True)
         try:
             monitors = self.physical_monitors()
@@ -757,6 +850,8 @@ class Capturer:
         return [m for m in data if isinstance(m, dict) and m.get("name")]
 
     def list_monitors(self) -> list:
+        if self.portal:  # the portal always returns the whole desktop in one image
+            return [("Whole desktop (all monitors)", "auto")]
         items = [("Primary / focused monitor", "auto"), ("All monitors", "all")]
         if self.wayland:
             if self.hypr and shutil.which("hyprctl"):
@@ -791,6 +886,8 @@ class Capturer:
 
     def grab_full(self, key: str):
         """Full-screen mode: the configured monitor, or every monitor for "all"."""
+        if self.portal:
+            return self.grab_desktop()
         if self.wayland:
             args = []
             out = None
@@ -820,11 +917,24 @@ class Capturer:
             raise CaptureError(f"Screen capture failed: {exc}") from exc
         return self._to_pil(shot)
 
+    def grab_desktop(self):
+        """The whole desktop (all monitors) as one image, through the screenshot portal."""
+        import ocr_wayland
+        return ocr_wayland.take_screenshot()
+
     def grab_region(self, region):
         """Region mode: only the stored region. Never falls back to full screen."""
         err = self.region_error(region)
         if err:
             raise CaptureError(err)
+        if region["type"] == "portal":
+            img = self.grab_desktop()
+            box = (int(region["left"]), int(region["top"]),
+                   int(region["left"]) + int(region["width"]), int(region["top"]) + int(region["height"]))
+            if box[2] > img.size[0] or box[3] > img.size[1]:
+                raise CaptureError(f"The stored region lies outside the desktop screenshot "
+                                   f"({img.size[0]}\u00d7{img.size[1]} px). Select the region again.")
+            return img.crop(box)
         if region["type"] == "geom":
             return self._grim(["-g", region["geom"]])
         mss, errors = _mss_module()
@@ -1558,26 +1668,26 @@ class HotkeyManager:
                   "using the lines below (they call --trigger).")
         if mode == "manual" or (mode == "auto" and detect_desktop() == "hyprland"):
             return False, manual, "info"
-        import ocr_portal
+        import ocr_wayland
         shortcuts = {}
         for action in HOTKEY_ORDER:
             seq = hotkeys.get(action)
-            trig = ocr_portal.to_portal_trigger(seq) if seq else None
+            trig = ocr_wayland.to_portal_trigger(seq) if seq else None
             if seq and not trig:
                 return False, f"'{HOTKEY_LABELS[action]}': unsupported hotkey {seq}.", "err"
             if trig:
                 shortcuts[action] = (HOTKEY_LABELS[action], trig)
         if not shortcuts:
             return True, "No hotkeys set.", "info"
-        ok, reason = ocr_portal.probe(self._portal_bus) if self._portal_bus else ocr_portal.probe()
+        ok, reason = ocr_wayland.probe(self._portal_bus) if self._portal_bus else ocr_wayland.probe()
         if not ok:
             return False, (f"Wayland: global shortcuts through the desktop portal aren't available ({reason}). "
                            "Bind the keys manually using the lines below (they call --trigger)."), "info"
         with self._lock:
             generation = self._generation
         cb = self._make_callback
-        client = ocr_portal.PortalShortcuts(shortcuts, lambda action: cb(action, generation)(),
-                                            **({"bus_factory": self._portal_bus} if self._portal_bus else {}))
+        client = ocr_wayland.PortalShortcuts(shortcuts, lambda action: cb(action, generation)(),
+                                             **({"bus_factory": self._portal_bus} if self._portal_bus else {}))
         client.start()
         with self._lock:
             self._listener = client

@@ -16,19 +16,6 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 
 Verified compatibility per distribution, desktop and Windows is tracked separately in [COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
-| Platform | Status |
-|---|---|
-| Linux, Hyprland / sway / other wlroots Wayland | Primary target (uses `grim` + `slurp`; hotkeys via compositor binds and `--trigger`) |
-| Linux, X11 | Supported (built-in region selector, `mss` capture, global hotkeys via `pynput`) |
-| Linux, GNOME / KDE on Wayland | Not supported (use an X11 session) |
-| Windows | Supported by design (same Qt selector, `mss`, `pynput`). The coordinate mapping (negative monitor origins, display scaling) and hotkey logic are unit-tested, work in progress|
-
-### System requirements per platform
-
-- **Windows / Linux X11 :** the Python packages in `requirements.txt` (`PySide6`, `Pillow`, `requests`, `mss`, `pynput`, a local OCR engine). Nothing else.
-- **Linux Wayland (Hyprland, sway, ...):** `grim` (screenshots) and `slurp` (region selector), e.g. `sudo pacman -S grim slurp`. `hyprctl` is used on Hyprland to list and pick monitors. `pynput` is installed but not used on Wayland.
-- **Region selection limits:** on Wayland the stored region is checked for a valid shape and size only. It cannot be checked against monitor changes, so after changing your monitor setup select the region again. On X11 / Windows it is checked against the current monitors automatically (see below).
-
 ## Install
 
 Requires Python 3.9+ for the cloud providers. **Local OCR needs Python 3.11+** (a requirement of ONNX Runtime) and was tested on 3.12.
@@ -49,10 +36,11 @@ cd text_ocr_scanner
 ### Option A: Local OCR (no key, recommended to start)
 
 1. Open the **AI Keys** tab and select **Local OCR (offline)** with its radio button. It is the default on a fresh install.
-2. Press **Test**. The first press loads the engine, then it should report `Works. Read: OCR TEST 123`.
-3. Open **Settings** and set the **Language of the text** (Japanese, Chinese, English or a Latin-script language).
-4. Open **Settings** and choose the output file name (a timestamp is added per launch, see [Output files](#output-files)).
-5. Go to **Capture** and press Start, or use one of the scan hotkeys.
+2. Download the Local OCR ```pip install rapidocr onnxruntime```. Restart
+3. Press **Test**. The first press loads the engine, then it should report `Works. Read: OCR TEST 123`.
+4. Open **Settings** and set the **Language of the text** (Japanese, Chinese, English or a Latin-script language).
+5. Open **Settings** and choose the output file name (a timestamp is added per launch, see [Output files](#output-files)).
+6. Go to **Capture** and press Start, or use one of the scan hotkeys.
 
 ### Option B: Cloud AI
 
@@ -68,11 +56,11 @@ You can combine both. Leave **Use as fallback** ticked on Local OCR and it takes
 
 Local OCR finds each line of text in the image, reads it, and gives it a confidence score. Lines below your minimum confidence are discarded, so a blurry icon or texture produces a gap rather than invented text. Tune it on the **AI Keys** tab, in the Local OCR card:
 
-| Setting | What it does | When to change it |
-|---|---|---|
-| **Model** | **Small** is fast and included with the install. **Medium** is more accurate but slower, and downloads once on first use | Try Medium if Small misreads your font |
-| **Minimum confidence** (default 70%) | Lines scoring lower are dropped | Raise it if junk characters get through. Lower it if real text goes missing |
-| **Largest image side** (default 1280 px) | The capture is shrunk to this size before reading | Raise it (for example 1920) if small text is missed. Lower it for faster full-screen scans |
+| Setting                                  | What it does                                                                                                             | When to change it                                                                          |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| **Model**                                | **Small**: fast and included with the install. <br>**Medium**: more accurate but slower, and downloads once on first use | Try Medium if Small misreads your font                                                     |
+| **Minimum confidence** (default 70%)     | Lines scoring lower are dropped                                                                                          | Raise it if junk characters get through. Lower it if real text goes missing                |
+| **Largest image side** (default 1280 px) | The capture is shrunk to this size before reading                                                                        | Raise it (for example 1920) if small text is missed. Lower it for faster full-screen scans |
 
 What it covers:
 
@@ -81,7 +69,7 @@ What it covers:
 
 ## Background daemon
 
-Capture, OCR, recording, hotkeys and the output file run in a **background daemon** (`ocr_daemon.py`, no PySide6 needed). The window (`ocr_scanner.py`) is a client of it. **Closing the window does not stop recording.** Opening the window again reconnects to the running daemon; if none is running, the window starts one. A second daemon can never start (OS file lock). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Capture, OCR, recording, hotkeys and the output file run in a **background daemon** (`ocr_daemon.py`, no PySide6 needed). The window (`ocr_scanner.py`) is a client of it. **Closing the window does not stop recording.** Opening the window again reconnects to the running daemon; if none is running, the window starts one.
 
 Linux (from the project folder; `run_daemon.sh` uses the same virtualenv as `run.sh`):
 
@@ -101,7 +89,7 @@ Windows: `run_daemon.bat start | stop | status | autostart enable | autostart di
 
 Run `autostart enable` from the same virtualenv you use for the app: the unit / registry value records that Python.
 
-Tray menu (when a tray is available): **Open Window**, **Open Output Folder**, and **Stop Daemon**. Closing the window hides it in the tray; **Stop Daemon** closes both the GUI and daemon.
+Tray menu (when a tray is available): **Open Window**, **Open Output Folder**, and **Stop Daemon**. Closing the window hides it in the tray; **Stop Daemon** closes both the GUI and daemon. GNOME needs an AppIndicator/System Tray extension, and KDE needs a System Tray widget in the panel. If no tray host is available, the app keeps the window visible instead of hiding an inaccessible GUI.
 
 ## Output files
 
@@ -168,7 +156,9 @@ hl.bind("CTRL + ALT + S", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/oc
 
 | Problem | Fix |
 |---|---|
-| `grim` / `slurp` not found | Install them (`sudo pacman -S grim slurp`) |
+| `grim` / `slurp` not found | Install them (`sudo pacman -S grim slurp`). On GNOME / KDE they are not used |
+| `compositor doesn't support zwlr_layer_shell_v1` or `compositor doesn't support the screen capture protocol` | The compositor (GNOME, KDE, ...) cannot run `grim` / `slurp`. Update to this version, which uses the screenshot portal there instead. Check `./run_daemon.sh status` for the backend in use, and install `xdg-desktop-portal-gnome` / `-kde` if capture then reports a missing portal |
+| Portal capture: "refused the screenshot" | Allow this app to take screenshots in the desktop's permission prompt or privacy settings, then try again |
 | Hotkey does nothing on Wayland | Add the compositor binds from Settings and make sure the daemon is running (`./run_daemon.sh status`) |
 | `--trigger` says the daemon is not running | `./run_daemon.sh start`, or open the window once |
 | Daemon works from a terminal but not from systemd | The service needs your session's `DISPLAY` / `WAYLAND_DISPLAY`. `autostart enable` imports them; re-run it from inside your desktop session. On Hyprland, the autostart setup also restarts both OCR services from the compositor startup hook so they come back after a manual stop on the previous login |
@@ -188,7 +178,9 @@ hl.bind("CTRL + ALT + S", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/oc
 The goal is to grow this from a script into a proper installable app that runs quietly in the background and works fully on Windows and Linux. 
 
 ### 1. Background service
-The core daemon, the thin GUI, per-user IPC, tray actions, systemd user service and Windows startup entry (see [Background daemon](#background-daemon)). ✅ DONE
+- [x] Create Core Daemon and connect GUI
+- [x] GUI in Tray
+- [x] systemd user service and autostart
 
 ### 2. Packaging
 Goal: install it without touching Python or a terminal.
@@ -206,16 +198,11 @@ Notes:
 
 ### 3. Full cross-platform compatibility
 
-| Gap | Plan |
-|---|---|
-| GNOME / KDE on Wayland has no capture | Use the xdg-desktop-portal Screenshot |
-| Wayland global hotkeys need manual compositor binds | Use the GlobalShortcuts portal where the compositor supports it (verify support per compositor) |
-| Windows is barely tested | Test on real machines: multi-monitor, mixed DPI scaling, Retina |
-
+See [COMPATIBILITY.md](docs/COMPATIBILITY.md) 
 ### 4. Quality and releases
-- GitHub Actions CI on Linux, Windows and macOS with headless tests, covering the OCR pipeline, config handling, hotkey parsing and IPC.
-- Tagged releases that build and attach the installers automatically.
-- In-app update check (notify only; no silent updates).
+- [ ] GitHub Actions CI on Linux, Windows with headless tests, covering the OCR pipeline, config handling, hotkey parsing and IPC.
+- [ ] Tagged releases that build and attach the installers automatically.
+- [ ] In-app update check (notify only; no silent updates).
 
 ### 5. Ideas (not committed)
 - Language-learning extras: word lookup, furigana, Anki export.

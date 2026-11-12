@@ -2,46 +2,44 @@
 
 ## Legend
 
-| Marker | Meaning |
-|---|---|
-| ✅ | Verified working on a real system of that type |
-| ❌ | Confirmed unsupported (tested or proven by design) |
-| ⚠️ | Partially supported, or a known limitation / fallback applies |
-| 🧪 | Logic is unit-tested against fakes (fake keyring, fake D-Bus portal, fake `systemctl`). **Not** run on a real system |
-| ❔ | Untested. Any expectation in Remarks is an expectation, not a result |
+| Marker | Meaning                                                       |
+| ------ | ------------------------------------------------------------- |
+| ✅      | Verified working on a real system of that type                |
+| ❌      | Confirmed unsupported for now                                 |
+| ⚠️     | Partially supported, or a known limitation / fallback applies |
+| ❔      | Untested.                                                     |
 
 
 ## Linux distributions
 
 Each distribution is listed with its default desktop. Desktop specific behaviour is in the next table.
 
-| Distribution | Desktop / compositor | Session | Global hotkeys | Background service | API key storage | Overall | Remarks |
-|---|---|---|---|---|---|---|---|
-| Ubuntu 24.04.5 LTS (container used for development) | none (headless) | none | ❔ | ✅ daemon + IPC · 🧪 systemd unit text and commands · ❔ real `systemctl --user` | 🧪 · ❔ real Secret Service | ⚠️ Partially verified (headless only) | No display, no D-Bus session, no keyring, no portal in this environment. The daemon started, answered IPC, stopped cleanly and refused a second instance in the end-to-end tests. `systemctl --user` is not usable here (`offline`) |
-| Ubuntu 24.04 LTS | GNOME 46 | Wayland (default), X11 | Wayland: ⚠️ expected fallback to manual instructions (GNOME 46 predates the GlobalShortcuts portal) · 🧪 fallback path · ❔ real. X11: ❔ | ❔ | ❔ | ❔ Untested | Needs `gnome-keyring` (normally preinstalled) for key storage. GNOME 48+ (Ubuntu 25.04 and later) is expected to offer the portal, see the GNOME rows |
-| Debian 12 | GNOME 43 | Wayland, X11 | Wayland: ⚠️ expected fallback to manual instructions · ❔ real. X11: ❔ | ❔ | ❔ | ❔ Untested | Same as Ubuntu 24.04. Debian 13 ships a newer GNOME: see the GNOME rows |
-| Linux Mint 22 | Cinnamon | X11 (default) | ❔ | ❔ | ❔ | ❔ Untested | Expected to use `pynput` on X11. Cinnamon is not known to offer the GlobalShortcuts portal, so Cinnamon Wayland would use manual instructions. `gnome-keyring` is usually installed |
-| Arch Linux | Hyprland | Wayland | see Hyprland row | ❔ | ❔ | ❔ Untested | This was the original target. A Secret Service provider is **not** installed by default on minimal Arch setups: install `gnome-keyring` (or use KWallet / KeePassXC). Without one the app keeps keys in `config.json` and warns |
-| Arch Linux | GNOME / KDE Plasma | Wayland, X11 | see GNOME / KDE rows | ❔ | ❔ | ❔ Untested | Needs the matching `xdg-desktop-portal-gnome` / `xdg-desktop-portal-kde` for portal hotkeys |
-| Other systemd based distributions (Fedora, openSUSE, ...) | any | any | ❔ | ❔ | ❔ | ❔ Untested | Not in the target list. Nothing in the code is distribution specific; distribution detection is used only for status output |
+| Distribution                                              | Desktop / compositor | Session         | Global hotkeys      | Background service | OCR Scanning          | Overall | Remarks                                                                        |
+| --------------------------------------------------------- | -------------------- | --------------- | ------------------- | ------------------ | --------------------- | ------- | ------------------------------------------------------------------------------ |
+| Ubuntu 24.04                                              | GNOME                | Wayland,<br>X11 | ❔                   | ✅                  | Wayland:⚠️<br>X11: ✅  | ⚠️      | OCR on GNOME on Wayland needs special permissions.<br>Better to use X11.       |
+| Debian 12                                                 | GNOME                | Wayland, X11    | ⚠️                  | ✅                  | Wayland:⚠️<br>X11: ✅  | ⚠️      | Mostly Untested / Testing                                                      |
+| Linux Mint 22                                             | Cinnamon             | X11             | ❔                   | ✅                  | ❔                     | ⚠️      | Mostly Untested / Testing                                                      |
+| Arch Linux                                                | Hyprland             | Wayland         | ✅                   | ✅                  | ✅                     | ✅       | Works                                                                          |
+| Arch Linux                                                | GNOME / KDE Plasma   | Wayland, X11    | Wayland:✅<br>X11: ✅ | ✅                  | Wayland: ⚠️<br>X11: ✅ | ⚠️      | OCR on GNOME / KDE on Wayland needs special permissions.<br>Better to use X11. |
+| Other systemd based distributions (Fedora, openSUSE, ...) | any                  | any             | ❔                   | ❔                  | ❔                     | ❔       | Untested                                                                       |
 
 ## Desktop environments and compositors
 
 Distribution is "any" unless stated: the code paths do not depend on the distribution.
 
-| Distribution | Desktop / compositor                              | Session | Global hotkeys                                                                                                                                           | Background service                                           | API key storage | Overall    | Remarks                                                                                                                                                                                                                                                                                                 |
-| ------------ | ------------------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | --------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| any          | Hyprland                                          | Wayland | 🧪 compositor binds (unchanged behaviour: the existing `hypr_snippet` output is byte-for-byte the same, and the portal is not touched) · ❔ real Hyprland | 🧪 unit is wanted by `hyprland-session.target` as before · ❔ | ❔               | ❔ Untested | Portal hotkeys on Hyprland are opt-in only. Hyprland's portal backend is reported to ignore the preferred key and to require `global` binds in the Hyprland config, so using it by default would silently stop hotkeys for existing users                                                               |
-| any          | GNOME 48 or newer                                 | Wayland | 🧪 portal logic against a fake portal · ❔ real                                                                                                           | ❔                                                            | ❔               | ❔ Untested | GlobalShortcuts reported to have landed in GNOME 48. May require the app to be known to the portal (a `.desktop` file named `ocr-scanner.desktop`); the app sends the portal registration call but this was never run against GNOME. If the portal call fails the app falls back to manual instructions |
-| any          | GNOME older than 48                               | Wayland | ⚠️ expected: portal not offered → manual instructions (Settings > Keyboard > Custom Shortcuts) · 🧪 fallback path · ❔ real                               | ❔                                                            | ❔               | ❔ Untested | The fallback gives the exact `--trigger` commands per action                                                                                                                                                                                                                                            |
-| any          | KDE Plasma                                        | Wayland | 🧪 portal logic against a fake portal · ❔ real                                                                                                           | ❔                                                            | ❔               | ❔ Untested | Reported to implement GlobalShortcuts and to show a confirmation dialog. While the dialog is open the app reports "waiting for you to confirm" and updates its status when answered. KWallet must expose the Secret Service for key storage                                                             |
-| any          | KDE Plasma                                        | X11     | ❔ (`pynput`)                                                                                                                                             | ❔                                                            | ❔               | ❔ Untested |                                                                                                                                                                                                                                                                                                         |
-| any          | Xfce, MATE, Cinnamon, LXQt and other X11 desktops | X11     | ❔ (`pynput`)                                                                                                                                             | ❔                                                            | ❔               | ❔ Untested | Autostart relies on `graphical-session.target`, which these desktops may not activate. If the unit does not start at login, start the daemon from the desktop's own autostart                                                                                                                           |
-| any          | sway, other wlroots compositors                   | Wayland | ⚠️ expected: portal not offered → manual `bindsym` lines · 🧪 text generation and fallback path · ❔ real                                                 | ❔                                                            | ❔               | ❔ Untested | wlroots is reported not to implement the GlobalShortcuts portal. Not confirmed here, hence ⚠️ and not ❌                                                                                                                                                                                                 |
-| any          | COSMIC and others                                 | any     | ❔                                                                                                                                                        | ❔                                                            | ❔               | ❔ Untested | Unknown portal support; the probe decides at runtime                                                                                                                                                                                                                                                    |
+| Distribution | Desktop / compositor                              | Session | Global hotkeys | Background service | API key storage | OCR | Remarks  |
+| ------------ | ------------------------------------------------- | ------- | -------------- | ------------------ | --------------- | --- | -------- |
+| any          | Hyprland                                          | Wayland | ✅              | ✅                  | ✅               | ✅   | Works    |
+| any          | GNOME 48 or newer                                 | Wayland | ✅              | ✅                  | ✅               | ⚠️  |          |
+| any          | GNOME                                             | X11     | ✅              | ✅                  | ✅               | ✅   | Works    |
+| any          | KDE Plasma                                        | Wayland | ✅              | ✅                  | ✅               | ⚠️  |          |
+| any          | KDE Plasma                                        | X11     | ✅              | ✅                  | ✅               | ✅   | Works    |
+| any          | Xfce, MATE, Cinnamon, LXQt and other X11 desktops | X11     | ❔              | ❔                  | ❔               | ❔   | Untested |
+| any          | sway, other wlroots compositors                   | Wayland | ❔              | ❔                  | ❔               | ❔   | Untested |
+
 
 ## Windows
 
-| OS | Desktop | Session | Global hotkeys | Background service | API key storage | Overall | Remarks |
-|---|---|---|---|---|---|---|---|
-| Windows 10 / 11 | Windows shell | Windows | 🧪 existing `pynput` mapping tests · ❔ real | 🧪 registry startup entry against a fake registry, existing IPC/lock code reviewed · ❔ real | 🧪 fake backend and size check · ❔ real Credential Manager | ❔ Untested | **No Windows machine was available. Nothing was run on Windows.** Static review only: every POSIX-only call in the code (`fcntl`, `os.getuid`, `SO_PEERCRED`, Unix sockets, `chmod`) sits in a branch that is skipped on Windows. Credential Manager limits a stored value to 2560 bytes (about 1280 characters), so very long lists of keys are refused with a clear message and the key then stays in `config.json` |
+| OS              | Desktop       | Session | Global hotkeys | Background service | API key storage | Overall | Remarks  |
+| --------------- | ------------- | ------- | -------------- | ------------------ | --------------- | ------- | -------- |
+| Windows 10 / 11 | Windows shell | Windows | ❔              | ❔                  | ❔               | ❔       | Untested |
