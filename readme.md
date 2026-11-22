@@ -10,6 +10,7 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 - **Scan current**: press a key and the *already configured* target is read once, with no selector: the stored region in region mode, the configured monitor (or all monitors) in full-screen mode
 - **Background daemon**: recording, hotkeys and OCR keep running when the window is closed; autostart via a systemd user service (Linux) or a startup entry (Windows)
 - **Local OCR (offline)**: reads text on your computer. No API key, no upload, no rate limits. It scores every line and drops anything it is unsure of instead of guessing
+- **Table Cleaner**: turns a raw output file into a tidy Markdown table (one row per line, repeats and noise removed), with an optional English translation column
 - **AI OCR**: optional cloud providers (Gemini, Groq, OpenRouter, Mistral, DeepSeek, Ollama or any OpenAI-compatible endpoint). Local OCR can serve as the automatic fallback when one fails
 
 ## Platform support
@@ -104,6 +105,34 @@ ocr_output.txt   ->   ocr_output_2026-01-31_14-05-09.txt
 - **Open Output File** and **Open Output Folder** (Settings and the tray menu) always refer to the active session file.
 - Duplicate filtering ("skip identical text", "only save new lines") works for the daemon's whole run, including across Start/Stop and scans.
 
+## Table Cleaner
+
+The raw output file is a running log: the same text again on every capture, noise lines, timestamps. The **Table Cleaner** tab turns it into a readable Markdown table. Your original file is never changed; the table is saved next to it:
+
+```
+ocr_output_2026-01-31_14-05-09.txt   ->   ocr_output_2026-01-31_14-05-09_table.md
+```
+
+Running it again never overwrites a table; it writes `_table_2.md`, `_table_3.md`, ...
+
+| # | Time | Text | English |
+|--:|------|------|---------|
+| 1 | 2026-01-31 14:05:09 | 猫が好き | I like cats |
+| 2 | 2026-01-31 14:05:15 | 天気がいいね | The weather is nice today |
+
+**Options**
+
+- **Language of the file**: the language the text is written in. `Auto-detect` is the default. It is used to guide the translation; it does not change how the table is built.
+- **Translate to English**: adds the *English* column. The *Time* column appears only when the file has timestamps (Settings > "Add a timestamp to every saved line").
+- **Translate with**: `Automatic` uses the active provider, then the fallbacks, from the **OCR Mode** tab. Or pick one provider. Local OCR can only read text, it can't translate, so translation needs a cloud provider (a free Google AI Studio key works) or Ollama (stays on your machine). The *text of the file* is sent to that provider, not screenshots.
+
+**What gets cleaned**
+
+- Timestamps are moved into the Time column. Blank lines and lines with no letters or digits (`|`, `---`) are dropped.
+- Repeats are removed, keeping the first one in its original order. Two lines count as the same when they differ only by case, spacing, punctuation or full-width vs half-width letters.
+- Spaces between Japanese / Chinese characters (an OCR artefact) are removed.
+- Characters that would break or restyle a Markdown table (`|`, `<`, `*`, backticks and so on) are escaped, so the table shows exactly what was on screen in any Markdown viewer.
+
 ## Capture modes
 
 - **Full screen**: reads the monitor chosen on the Capture page, or all monitors.
@@ -171,6 +200,8 @@ hl.bind("CTRL + ALT + S", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/oc
 | Local OCR: real text missing | Lower **Minimum confidence**, or raise **Largest image side**. Try the **Medium** model |
 | "Local OCR does not cover Korean" (or Russian, Arabic, Hindi, Thai) | Not supported locally. Switch to a cloud provider |
 | Medium model fails to load | It downloads on first use and needs internet. Switch back to Small, which works offline |
+| Cleaner: "Translation needs an AI provider" | Local OCR can't translate. Add a key on the OCR Mode tab (or set up Ollama), or untick **Translate** |
+| Cleaner: some rows say `_(not translated)_` | The provider skipped them or hit a limit. Run the cleaner again, or choose another provider in **Translate with** |
 | Qt fails to start on X11 | Install `libxcb-cursor0` (Ubuntu) or `xcb-util-cursor` (Arch) |
 
 ## Roadmap

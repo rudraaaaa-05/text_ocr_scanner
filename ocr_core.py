@@ -228,6 +228,9 @@ def default_config() -> dict:
             p["id"]: {"keys": "", "model": p["model"], "base_url": p["base_url"], "fallback": p["fallback"]}
             for p in PROVIDERS
         },
+        "cleaner_language": "Auto-detect",   # language of the text in the files the Cleaner tab reads
+        "cleaner_translate": False,          # add an English column to the table
+        "cleaner_provider": "auto",          # which provider translates: "auto" or a provider id
         "tray_on_close": False,
         "notifications": True,
         "hypr_syntax": "auto",
@@ -1150,6 +1153,11 @@ def call_provider(pdef: dict, pc: dict, key: str, data: bytes, mime: str, prompt
             )
     except requests.exceptions.RequestException as exc:
         raise OCRError(f"network error ({exc.__class__.__name__})")
+    return _read_reply(pdef, resp, key)
+
+
+def _read_reply(pdef: dict, resp, key: str) -> str:
+    """Status check and text extraction shared by the image call and the text-only call."""
     if resp.status_code >= 400:
         raise OCRError(redact(f"HTTP {resp.status_code}: {_err_message(resp)}", key), skip_provider=resp.status_code == 404)
     try:
@@ -1167,6 +1175,45 @@ def call_provider(pdef: dict, pc: dict, key: str, data: bytes, mime: str, prompt
         return content or ""
     except (ValueError, KeyError, IndexError, TypeError):
         raise OCRError("unexpected response from the API")
+
+
+def call_provider_text(pdef: dict, pc: dict, key: str, prompt: str) -> str:
+    """Text-only request (no image). Used by the Cleaner tab to translate. Same providers, same errors."""
+    model = (pc.get("model") or "").strip()
+    if not model:
+        raise OCRError("no model set", skip_provider=True)
+    try:
+        if pdef["kind"] == "gemini":
+            if model.startswith("models/"):
+                model = model[7:]
+            resp = requests.post(
+                f"{pdef['base_url']}/models/{model}:generateContent",
+                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0, "maxOutputTokens": 8192},
+                },
+                timeout=(10, 90),
+            )
+        elif pdef["kind"] == "openai":
+            base = (pc.get("base_url") or "").strip().rstrip("/")
+            if not base:
+                raise OCRError("no base URL set", skip_provider=True)
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            resp = requests.post(
+                base + "/chat/completions",
+                headers=headers,
+                json={"model": model, "temperature": 0, "max_tokens": 4096,
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=(10, 90),
+            )
+        else:
+            raise OCRError("this provider cannot translate text", skip_provider=True)
+    except requests.exceptions.RequestException as exc:
+        raise OCRError(f"network error ({exc.__class__.__name__})")
+    return _read_reply(pdef, resp, key)
 
 
 def _is_zero(v) -> bool:

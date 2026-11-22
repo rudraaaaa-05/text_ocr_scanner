@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import html
 import logging
 import os
@@ -14,6 +15,7 @@ from pathlib import Path
 
 from ocr_core import *  # noqa: F401,F403  (Qt-free core: config, capture, OCR providers, constants)
 from ocr_core import _merge, _is_int  # noqa: F401
+from ocr_cleaner import CleanerCancelled, CleanerError, Translator, clean_file, is_english
 from ocr_daemon import DaemonLink, InstanceLock, cli_trigger, request, send_command, start_daemon  # noqa: F401
 
 if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "--trigger":
@@ -42,6 +44,11 @@ except ImportError as _exc:  # pragma: no cover
         "Install everything with:  pip install -r requirements.txt   (or just use run.sh / run.bat)\n"
     )
     sys.exit(1)
+
+
+# sidebar order; the stack of pages is built in the same order
+PAGE_NAMES = ("Capture", "OCR Mode", "Table Cleaner", "Settings")
+PAGE_CAPTURE, PAGE_OCR_MODE, PAGE_CLEANER, PAGE_SETTINGS = range(4)
 
 
 def match_screens(screens, monitors) -> dict:
@@ -275,6 +282,8 @@ class Bus(QObject):
     test_done = Signal(str, bool, str)
     notify = Signal(str, str)
     failure = Signal(str)                 # an error the user must see (log + notification)
+    clean_progress = Signal(int, int, str)  # Cleaner tab: done, total, what is happening
+    clean_done = Signal(object, str)        # Cleaner tab: CleanResult or None, error text ("cancelled" if stopped)
 
     def __init__(self):
         super().__init__()
@@ -649,6 +658,9 @@ class MainWindow(QMainWindow):
         self._select_cb = None
         self._overlay = None
         self._really_quit = False
+        self._cleaning = False
+        self._clean_cancel = threading.Event()
+        self._clean_path = None
         self.cards = {}
         self.tray = None
         self.link = None
@@ -675,6 +687,8 @@ class MainWindow(QMainWindow):
         bus.models_ready.connect(self._on_models_ready)
         bus.test_done.connect(self._on_test_done)
         bus.notify.connect(self.notify)
+        bus.clean_progress.connect(self._on_clean_progress)
+        bus.clean_done.connect(self._on_clean_done)
 
         self._set_state("idle")
         self._apply_mode_ui()
@@ -719,7 +733,7 @@ class MainWindow(QMainWindow):
             err = reply.get("error") or {}
             self.add_log("err", err.get("message", "The command failed."))
             if err.get("code") == "ocr_unavailable":
-                self.show_page(1)
+                self.show_page(PAGE_OCR_MODE)
             return
         data = reply.get("data") or {}
         if isinstance(data, dict) and "state" in data:
@@ -858,7 +872,7 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         self.nav_btns = []
-        for i, name in enumerate(("Capture", "OCR Mode", "Settings")):
+        for i, name in enumerate(PAGE_NAMES):
             b = QPushButton(name)
             b.setObjectName("nav")
             b.setCheckable(True)
@@ -881,6 +895,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_capture_page())
         self.stack.addWidget(self._build_keys_page())
+        self.stack.addWidget(self._build_cleaner_page())
         self.stack.addWidget(self._build_settings_page())
         outer.addWidget(self.stack, 1)
         self.show_page(0)
@@ -888,6 +903,8 @@ class MainWindow(QMainWindow):
     def show_page(self, idx: int):
         self.stack.setCurrentIndex(idx)
         self.nav_btns[idx].setChecked(True)
+        if idx == PAGE_CLEANER:
+            self._refresh_clean_providers()  # keys may have been added on the OCR Mode tab since last time
 
     def _page(self):
         w = QWidget()
@@ -1020,6 +1037,233 @@ class MainWindow(QMainWindow):
         if not on:
             return
         self.set_cfg("active_provider", pid)  # the daemon warms the local engine when it reloads the settings
+
+    # table cleaner page
+    _CLEAN_TRANSLATE_NOTE = ("Translation is done by an AI provider from the OCR Mode tab (a free Google AI Studio key "
+                             "works, or Ollama to stay offline). The text of the file is sent to that provider. "
+                             "Local OCR can't translate.")
+
+    def _build_cleaner_page(self):
+        page, lay = self._page()
+        h, sub = page_header("Table Cleaner", "Turns a raw output file into a tidy Markdown table: one row per line of text, "
+                                              "repeats and noise removed, optionally with an English column.")
+        lay.addWidget(h)
+        lay.addWidget(sub)
+
+        card, cl = make_card("File to clean", "Pick any output file. The table is saved next to it as "
+                                              "<name>_table.md. The original file is never changed.")
+        self.clean_src = QLineEdit()
+        self.clean_src.setPlaceholderText("Leave empty to use this session's output file")
+        self.clean_src.setMinimumWidth(320)
+        btn_pick = QPushButton("Browse")
+        btn_pick.clicked.connect(self.browse_clean_source)
+        btn_sess = QPushButton("Use this session's file")
+        btn_sess.setToolTip("The file the daemon is writing to right now.")
+        btn_sess.clicked.connect(self.use_session_for_cleaner)
+        cl.addLayout(h_row(self.clean_src, btn_pick, btn_sess))
+        lay.addWidget(card)
+
+        card, cl = make_card("Options")
+        self.clean_lang = QComboBox()
+        self.clean_lang.setEditable(True)
+        self.clean_lang.addItems(LANGUAGES)
+        self.clean_lang.setCurrentText(self.d["cleaner_language"])
+        self.clean_lang.setMinimumWidth(220)
+        self.clean_lang.setToolTip("The language the text in the file is written in. Auto-detect works for most files.")
+        self.clean_lang.currentTextChanged.connect(self._clean_lang_changed)
+        cl.addLayout(h_row(QLabel("Language of the file"), self.clean_lang, stretch_end=True))
+
+        self.clean_translate = QCheckBox("Translate to English (adds an English column)")
+        self.clean_translate.setChecked(bool(self.d["cleaner_translate"]))
+        self.clean_translate.toggled.connect(self._clean_translate_toggled)
+        cl.addWidget(self.clean_translate)
+
+        self.clean_provider = QComboBox()
+        self.clean_provider.setMinimumWidth(260)
+        self.clean_provider.currentIndexChanged.connect(self._clean_provider_changed)
+        self.clean_provider_row = QWidget()
+        pr = QHBoxLayout(self.clean_provider_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        pr.setSpacing(10)
+        pr.addWidget(QLabel("Translate with"))
+        pr.addWidget(self.clean_provider)
+        pr.addStretch(1)
+        cl.addWidget(self.clean_provider_row)
+        self.clean_translate_note = muted(self._CLEAN_TRANSLATE_NOTE)
+        cl.addWidget(self.clean_translate_note)
+        lay.addWidget(card)
+
+        card, cl = make_card("Result")
+        self.btn_clean = QPushButton("Clean and save table")
+        self.btn_clean.setObjectName("primary")
+        self.btn_clean.clicked.connect(self.run_cleaner)
+        self.btn_clean_cancel = QPushButton("Cancel")
+        self.btn_clean_cancel.clicked.connect(self.cancel_cleaner)
+        self.btn_clean_cancel.setEnabled(False)
+        cl.addLayout(h_row(self.btn_clean, self.btn_clean_cancel, stretch_end=True))
+        self.clean_status = QLabel("")
+        self.clean_status.setWordWrap(True)
+        self.clean_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        cl.addWidget(self.clean_status)
+        self.clean_preview = QPlainTextEdit()
+        self.clean_preview.setReadOnly(True)
+        self.clean_preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.clean_preview.setPlaceholderText("A preview of the table appears here.")
+        self.clean_preview.setMinimumHeight(220)
+        cl.addWidget(self.clean_preview, 1)
+        self.btn_clean_open = QPushButton("Open table")
+        self.btn_clean_open.clicked.connect(self.open_clean_file)
+        self.btn_clean_folder = QPushButton("Open folder")
+        self.btn_clean_folder.clicked.connect(self.open_clean_folder)
+        for b in (self.btn_clean_open, self.btn_clean_folder):
+            b.setEnabled(False)
+        cl.addLayout(h_row(self.btn_clean_open, self.btn_clean_folder, stretch_end=True))
+        lay.addWidget(card, 1)
+
+        self._refresh_clean_providers()
+        self._apply_clean_ui()
+        return scroll_wrap(page)
+
+    def _clean_status(self, text: str, level: str = "info"):
+        color = {"info": "#85858d", "ok": "#7ee2a8", "warn": "#f5b942", "err": "#ff6b70"}[level]
+        self.clean_status.setStyleSheet(f"color: {color};")
+        self.clean_status.setText(text)
+
+    def _clean_lang_changed(self, text: str):
+        self.set_cfg("cleaner_language", text.strip() or "Auto-detect")
+        self._apply_clean_ui()
+
+    def _clean_translate_toggled(self, on: bool):
+        self.set_cfg("cleaner_translate", bool(on))
+        self._apply_clean_ui()
+
+    def _clean_provider_changed(self, _i):
+        if self._cleaning:
+            return
+        pid = self.clean_provider.currentData()
+        if pid:
+            self.set_cfg("cleaner_provider", pid)
+
+    def _apply_clean_ui(self):
+        """Provider row only matters while Translate is ticked and the language isn't English."""
+        want = self.clean_translate.isChecked()
+        english = is_english(self.clean_lang.currentText())
+        self.clean_provider_row.setVisible(want and not english)
+        self.clean_translate_note.setText(
+            "The file is English, so there is nothing to translate: no English column will be added."
+            if want and english else self._CLEAN_TRANSLATE_NOTE)
+        self.clean_translate_note.setVisible(want)
+
+    def _refresh_clean_providers(self):
+        """Fill the 'Translate with' list with the providers that can translate right now."""
+        self.clean_provider.blockSignals(True)
+        self.clean_provider.clear()
+        self.clean_provider.addItem("Automatic (the active provider, then the fallbacks)", "auto")
+        for pid, name in Translator.available(self.d):
+            self.clean_provider.addItem(name, pid)
+        want = self.d.get("cleaner_provider", "auto")
+        idx = self.clean_provider.findData(want)
+        self.clean_provider.setCurrentIndex(idx if idx >= 0 else 0)
+        self.clean_provider.blockSignals(False)
+
+    def browse_clean_source(self):
+        start = str(self.session_file.parent) if self.session_file else os.path.dirname(os.path.expanduser(self.d["output_file"]))
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the file to clean", start,
+                                              "Text files (*.txt);;All files (*)")
+        if path:
+            self.clean_src.setText(path)
+
+    def use_session_for_cleaner(self):
+        if self.session_file is None:
+            self._clean_status("There is no session file yet. Capture something first, or browse for a file.", "warn")
+            return
+        self.clean_src.setText(str(self.session_file))
+
+    def run_cleaner(self):
+        if self._cleaning:
+            return
+        src = self.clean_src.text().strip() or (str(self.session_file) if self.session_file else "")
+        if not src:
+            self._clean_status("Choose a file to clean first.", "err")
+            return
+        translate = self.clean_translate.isChecked()
+        language = self.clean_lang.currentText().strip() or "Auto-detect"
+        provider = self.clean_provider.currentData() or "auto"
+        cfg = copy.deepcopy(self.d)  # the worker gets its own copy; the user may keep editing settings meanwhile
+        cancel = threading.Event()
+        self._clean_cancel = cancel
+        self._cleaning = True
+        self._clean_path = None
+        self.btn_clean.setEnabled(False)
+        self.btn_clean_cancel.setEnabled(True)
+        self.btn_clean_open.setEnabled(False)
+        self.btn_clean_folder.setEnabled(False)
+        self._clean_status("Starting...", "info")
+        bus = self.bus
+
+        def work():
+            try:
+                res = clean_file(src, translate=translate, language=language, cfg=cfg, provider=provider,
+                                 progress=lambda d, t, m: bus.post("clean_progress", d, t, m), cancel=cancel.is_set)
+            except CleanerCancelled:
+                bus.post("clean_done", None, "cancelled")
+            except CleanerError as exc:
+                bus.post("clean_done", None, str(exc))
+            except Exception as exc:  # thread boundary: the button must never stay disabled
+                log.exception("Cleaner: unexpected error")
+                bus.post("clean_done", None, f"Unexpected error: {exc.__class__.__name__}: {exc}")
+            else:
+                bus.post("clean_done", res, "")
+
+        threading.Thread(target=work, daemon=True, name="cleaner").start()
+
+    def cancel_cleaner(self):
+        self._clean_cancel.set()
+        self._clean_status("Cancelling...", "info")
+
+    def _on_clean_progress(self, done: int, total: int, what: str):
+        if self._cleaning:
+            self._clean_status(f"{what}... {done} / {total}" if total > 1 else f"{what}...", "info")
+
+    def _on_clean_done(self, res, err: str):
+        self._cleaning = False
+        self.btn_clean.setEnabled(True)
+        self.btn_clean_cancel.setEnabled(False)
+        if res is None:
+            if err == "cancelled":
+                self._clean_status("Cancelled. Nothing was saved.", "warn")
+            else:
+                self._clean_status(err, "err")
+                self.add_log("err", f"Cleaner: {err}")
+            return
+        self._clean_path = res.path
+        lines = res.markdown.splitlines()
+        shown = "\n".join(lines[:300])
+        if len(lines) > 300:
+            shown += f"\n... ({len(lines) - 300} more lines in the file)"
+        self.clean_preview.setPlainText(shown)
+        level = "warn" if res.failed_count or res.notes else "ok"
+        text = f"Saved {res.path}\n{res.summary()}."
+        for note in res.notes:
+            text += f"\n{note}"
+        self._clean_status(text, level)
+        self.add_log("ok", f"Cleaner: saved {res.path} ({res.summary()})")
+        self.btn_clean_open.setEnabled(True)
+        self.btn_clean_folder.setEnabled(True)
+
+    def open_clean_file(self):
+        p = self._clean_path
+        if p is None or not p.exists():
+            self._clean_status("The table file no longer exists.", "warn")
+            return
+        self.open_url(QUrl.fromLocalFile(str(p)).toString())
+
+    def open_clean_folder(self):
+        p = self._clean_path
+        if p is None or not p.parent.exists():
+            self._clean_status("The folder no longer exists.", "warn")
+            return
+        self.open_url(QUrl.fromLocalFile(str(p.parent)).toString())
 
     # -- settings page
     def _bind_check(self, chk: QCheckBox, key: str):
@@ -1582,6 +1826,7 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        self._clean_cancel.set()  # a running Cleaner job stops at its next step
         self.bus.close()  # worker threads may keep running; their signals are now dropped
         self._cancel_selection()
         if self.link is not None:
