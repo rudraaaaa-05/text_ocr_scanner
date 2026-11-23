@@ -1,0 +1,3 @@
+# Optional: Japanese word-by-word mode in the Table Cleaner (pip install -r requirements-vocab.txt)
+sudachipy>=0.6.8
+sudachidict_core

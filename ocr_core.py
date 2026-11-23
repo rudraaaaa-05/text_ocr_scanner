@@ -230,6 +230,8 @@ def default_config() -> dict:
         },
         "cleaner_language": "Auto-detect",   # language of the text in the files the Cleaner tab reads
         "cleaner_translate": False,          # add an English column to the table
+        "cleaner_vocab": False,              # one row per WORD instead of one row per sentence
+        "cleaner_furigana": True,            # leave out furigana lines (small hiragana readings above kanji)
         "cleaner_provider": "auto",          # which provider translates: "auto" or a provider id
         "tray_on_close": False,
         "notifications": True,

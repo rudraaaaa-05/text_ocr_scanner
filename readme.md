@@ -10,7 +10,7 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 - **Scan current**: press a key and the *already configured* target is read once, with no selector: the stored region in region mode, the configured monitor (or all monitors) in full-screen mode
 - **Background daemon**: recording, hotkeys and OCR keep running when the window is closed; autostart via a systemd user service (Linux) or a startup entry (Windows)
 - **Local OCR (offline)**: reads text on your computer. No API key, no upload, no rate limits. It scores every line and drops anything it is unsure of instead of guessing
-- **Table Cleaner**: turns a raw output file into a tidy Markdown table (one row per line, repeats and noise removed), with an optional English translation column
+- **Table Cleaner**: turns a raw output file into a tidy Markdown table, one row per sentence (wrapped lines rejoined) or per word, repeats and noise removed, with an optional English translation column
 - **AI OCR**: optional cloud providers (Gemini, Groq, OpenRouter, Mistral, DeepSeek, Ollama or any OpenAI-compatible endpoint). Local OCR can serve as the automatic fallback when one fails
 
 ## Platform support
@@ -107,7 +107,7 @@ ocr_output.txt   ->   ocr_output_2026-01-31_14-05-09.txt
 
 ## Table Cleaner
 
-The raw output file is a running log: the same text again on every capture, noise lines, timestamps. The **Table Cleaner** tab turns it into a readable Markdown table. Your original file is never changed; the table is saved next to it:
+The raw output file is a running log: the same text again on every capture, noise lines, timestamps, sentences cut in two where the page wrapped. The **Table Cleaner** tab turns it into a readable Markdown table. Your original file is never changed; the table is saved next to it:
 
 ```
 ocr_output_2026-01-31_14-05-09.txt   ->   ocr_output_2026-01-31_14-05-09_table.md
@@ -115,16 +115,25 @@ ocr_output_2026-01-31_14-05-09.txt   ->   ocr_output_2026-01-31_14-05-09_table.m
 
 Running it again never overwrites a table; it writes `_table_2.md`, `_table_3.md`, ...
 
-| # | Time | Text | English |
-|--:|------|------|---------|
-| 1 | 2026-01-31 14:05:09 | 猫が好き | I like cats |
-| 2 | 2026-01-31 14:05:15 | 天気がいいね | The weather is nice today |
+**Sentence by sentence (the default).** One row per sentence. Lines that the page wrapped are glued back together, and a line that holds several sentences becomes several rows:
+
+| # | Sentence | English |
+|--:|----------|---------|
+| 1 | こないだカフェーにいった。 | I went to a cafe the other day. |
+| 2 | どこでしたか？。 | Where was it? |
+| 3 | 覚えていない。 | I don't remember. |
+
+**Word by word** (tick *Word by word (vocabulary list)*). One row per word, in dictionary form, with its reading and the sentence it came from. Particles, endings, numbers and people's names are left out, and each word appears once:
+
+| # | Word | Reading | English | Sentence |
+|--:|------|---------|---------|----------|
+| 1 | 行く | いく | to go | こないだカフェーにいった。 |
 
 **Options**
 
-- **Language of the file**: the language the text is written in. `Auto-detect` is the default. It is used to guide the translation; it does not change how the table is built.
-- **Translate to English**: adds the *English* column. The *Time* column appears only when the file has timestamps (Settings > "Add a timestamp to every saved line").
-- **Translate with**: `Automatic` uses the active provider, then the fallbacks, from the **OCR Mode** tab. Or pick one provider. Local OCR can only read text, it can't translate, so translation needs a cloud provider (a free Google AI Studio key works) or Ollama (stays on your machine). The *text of the file* is sent to that provider, not screenshots.
+- **Language of the file**: the language the text is written in. `Auto-detect` is the default.
+- **Word by word**: see above. Languages written with spaces (English, German, ...) work out of the box. **Japanese needs one extra package**, the SudachiPy word splitter: `pip install -r requirements-vocab.txt` (the tab shows the exact command for your Python when it is missing). Chinese and Thai are not supported yet; use sentence mode.
+- **Translate to English**: adds the *English* column. In word mode each word is translated as it is used in its sentence. The *Time* column appears only when the file has timestamps.
 
 **What gets cleaned**
 
@@ -200,6 +209,7 @@ hl.bind("CTRL + ALT + S", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/oc
 | Local OCR: real text missing | Lower **Minimum confidence**, or raise **Largest image side**. Try the **Medium** model |
 | "Local OCR does not cover Korean" (or Russian, Arabic, Hindi, Thai) | Not supported locally. Switch to a cloud provider |
 | Medium model fails to load | It downloads on first use and needs internet. Switch back to Small, which works offline |
+| Cleaner: "Japanese word splitting needs the SudachiPy package" | Only for **Word by word** with Japanese text: run the `pip install` command shown on the tab (or `pip install -r requirements-vocab.txt` in the app's environment) |
 | Cleaner: "Translation needs an AI provider" | Local OCR can't translate. Add a key on the OCR Mode tab (or set up Ollama), or untick **Translate** |
 | Cleaner: some rows say `_(not translated)_` | The provider skipped them or hit a limit. Run the cleaner again, or choose another provider in **Translate with** |
 | Qt fails to start on X11 | Install `libxcb-cursor0` (Ubuntu) or `xcb-util-cursor` (Arch) |
@@ -222,19 +232,17 @@ Goal: install it without touching Python or a terminal.
 | macOS | Signed and notarized `.app` / `.dmg` |
 | Linux | AppImage first, then an AUR package and `.deb` |
 
-Notes:
-- Candidate tooling: PyInstaller, Briefcase or Nuitka. Pick one and test the bundle size and startup time.
-- Unsigned Windows builds trigger SmartScreen warnings, and macOS requires an Apple Developer account ($99/year) to notarize. Budget for both.
-- Flatpak is attractive but its sandbox conflicts with `grim`, `hyprctl` and global hotkeys. Evaluate it later, not first.
-
 ### 3. Full cross-platform compatibility
 
 See [COMPATIBILITY.md](docs/COMPATIBILITY.md) 
+
 ### 4. Quality and releases
 - [ ] GitHub Actions CI on Linux, Windows with headless tests, covering the OCR pipeline, config handling, hotkey parsing and IPC.
 - [ ] Tagged releases that build and attach the installers automatically.
 - [ ] In-app update check (notify only; no silent updates).
 
-### 5. Ideas (not committed)
-- Language-learning extras: word lookup, furigana, Anki export.
-- Per-profile settings (for example one for games, one for manga).
+### 5. Ideas 
+- [x] Local Dictionary 
+- [ ] FlashCard maker (Anki export)
+- [x] Word Lookup
+- [ ] Add Support for non-japanese dictionaries 

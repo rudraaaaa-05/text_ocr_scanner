@@ -12,6 +12,10 @@ from pathlib import Path
 from ocr_core import (
     PROVIDER_BY_ID, OCRClient, OCRError, call_provider_text, parse_keys,
 )
+from ocr_nlp import (  # noqa: F401  (display_width is re-exported: the table code and the tests use it from here)
+    Line, WordSplitError, display_width, drop_furigana, extract_words, join_lines, optional_tokenizer,
+    split_sentences,
+)
 
 MAX_SOURCE_BYTES = 50 * 1024 * 1024
 MAX_TRANSLATE_ENTRIES = 2000   # one run never burns more than this many entries of somebody's free quota
@@ -92,6 +96,8 @@ class Parsed:
     duplicates: int = 0
     noise: int = 0
     has_times: bool = False
+    furigana: list = field(default_factory=list)   # furigana lines that were left out (reported in the file)
+    unit: str = "entry"                            # what one entry is: a line, or (after to_sentences) a sentence
 
 
 def parse_output(text: str) -> Parsed:
@@ -118,6 +124,28 @@ def parse_output(text: str) -> Parsed:
         out.entries.append(Entry(body, stamp))
         if stamp:
             out.has_times = True
+    return out
+
+
+def to_sentences(parsed: Parsed, *, ignore_furigana: bool = True, get_tokenizer=None) -> Parsed:
+    """Lines -> sentences: furigana out, wrapped lines glued together, lines with several sentences split."""
+    lines = [Line(e.text, e.first_seen) for e in parsed.entries]
+    removed = []
+    if ignore_furigana:
+        lines, removed = drop_furigana(lines, get_tokenizer)
+    out = Parsed(lines_read=parsed.lines_read, duplicates=parsed.duplicates, noise=parsed.noise,
+                 has_times=parsed.has_times, furigana=removed, unit="sentence")
+    seen = set()
+    for chunk in join_lines(lines):
+        for sentence in split_sentences(chunk.text):
+            if not has_content(sentence):
+                continue
+            key = dedupe_key(sentence)
+            if key in seen:
+                out.duplicates += 1
+                continue
+            seen.add(key)
+            out.entries.append(Entry(sentence, chunk.stamp))
     return out
 
 
@@ -154,15 +182,6 @@ def cell(text: str) -> str:
     return "".join(out)
 
 
-def display_width(s: str) -> int:
-    w = 0
-    for ch in s:
-        if unicodedata.combining(ch):
-            continue
-        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-    return w
-
-
 def _pad(s: str, width: int, right: bool = False) -> str:
     gap = max(0, width - display_width(s))
     return (" " * gap + s) if right else (s + " " * gap)
@@ -183,34 +202,67 @@ def render_table(columns: list, rows: list, right_aligned=(0,)) -> str:
     return "\n".join([head, sep] + body)
 
 
+_MODE_LABEL = {"lines": "line by line", "sentence": "sentence by sentence", "vocab": "word by word (vocabulary list)"}
+
+
 def build_markdown(entries: list, *, source_name: str, language: str, translated: bool, with_times: bool,
-                   parsed: Parsed, provider_name: str = "", notes=(), clock=datetime.now) -> str:
-    columns = ["#"] + (["Time"] if with_times else []) + ["Text"] + (["English"] if translated else [])
-    rows = []
-    for n, e in enumerate(entries, 1):
-        row = [str(n)]
-        if with_times:
-            row.append(e.first_seen or "")
-        row.append(cell(e.text))
-        if translated:
-            row.append(cell(e.translation) if e.translation else NOT_TRANSLATED)
-        rows.append(row)
+                   parsed: Parsed, provider_name: str = "", notes=(), clock=datetime.now, mode: str = "lines",
+                   words: list | None = None) -> str:
+    """`entries` are the rows of a line / sentence table. In "vocab" mode they are the sentences the `words` came from."""
+    if mode == "vocab":
+        has_reading = any(w.reading for w in words)
+        columns = ["#", "Word"] + (["Reading"] if has_reading else []) + (["English"] if translated else []) + ["Sentence"]
+        rows = []
+        for n, w in enumerate(words, 1):
+            row = [str(n), cell(w.word)]
+            if has_reading:
+                row.append(cell(w.reading))
+            if translated:
+                row.append(cell(w.translation) if w.translation else NOT_TRANSLATED)
+            row.append(cell(w.sentence))
+            rows.append(row)
+        right = (0,)
+    else:
+        columns = ["#"] + (["Time"] if with_times else []) + ["Text" if mode == "lines" else "Sentence"] \
+            + (["English"] if translated else [])
+        rows = []
+        for n, e in enumerate(entries, 1):
+            row = [str(n)]
+            if with_times:
+                row.append(e.first_seen or "")
+            row.append(cell(e.text))
+            if translated:
+                row.append(cell(e.translation) if e.translation else NOT_TRANSLATED)
+            rows.append(row)
+        right = (0,)
     lang = (language or "").strip() or "Auto-detect"
-    info = [f"Source: `{source_name}`", f"Created: {clock():%Y-%m-%d %H:%M}", f"Language: {lang}"]
+    info = [f"Source: `{source_name}`", f"Created: {clock():%Y-%m-%d %H:%M}", f"Language: {lang}",
+            f"Organised: {_MODE_LABEL[mode]}"]
     if translated and provider_name:
         info.append(f"Translated with: {provider_name}")
-    stats = f"{len(entries)} {_plural(len(entries), 'entry', 'entries')} from {parsed.lines_read} {_plural(parsed.lines_read, 'line')}"
+    unit = ("sentence", "sentences") if parsed.unit == "sentence" else ("entry", "entries")
+    stats = f"{len(entries)} {_plural(len(entries), *unit)} from {parsed.lines_read} {_plural(parsed.lines_read, 'line')}"
     removed = []
     if parsed.duplicates:
         removed.append(f"{parsed.duplicates} {_plural(parsed.duplicates, 'duplicate')}")
     if parsed.noise:
         removed.append(f"{parsed.noise} noise {_plural(parsed.noise, 'line')}")
+    if parsed.furigana:
+        removed.append(f"{len(parsed.furigana)} furigana {_plural(len(parsed.furigana), 'line')}")
     if removed:
-        stats += " (removed " + " and ".join(removed) + ")"
-    parts = ["# OCR table", "", "  \n".join(info), "", stats, ""]
+        stats += " (removed " + ", ".join(removed[:-1]) + (" and " if len(removed) > 1 else "") + removed[-1] + ")"
+    parts = ["# OCR table", "", "  \n".join(info), "", stats]
+    if mode == "vocab":
+        parts[-1] = stats + "  \n" + f"{len(words)} {_plural(len(words), 'word')} from {len(entries)} " \
+                                       f"{_plural(len(entries), *unit)}"
+    parts.append("")
+    if parsed.furigana:
+        shown = ", ".join(parsed.furigana[:12]) + (f" and {len(parsed.furigana) - 12} more" if len(parsed.furigana) > 12 else "")
+        parts += [f"> Left out as furigana (small reading lines above kanji): {shown}. "
+                  "Untick \"Ignore furigana\" to keep them.", ""]
     for note in notes:
         parts += [f"> {note}", ""]
-    parts += [render_table(columns, rows), ""]
+    parts += [render_table(columns, rows, right), ""]
     return "\n".join(parts)
 
 
@@ -250,17 +302,26 @@ def is_english(language: str) -> bool:
     return (language or "").strip().lower().startswith("english")
 
 
-def build_translation_prompt(items: dict, language: str) -> str:
+def build_translation_prompt(items: dict, language: str, words: bool = False) -> str:
+    """`items` maps an id to a text. With words=True each value is {"word": ..., "sentence": ...} instead."""
     lang = (language or "").strip()
     src = "automatically detect the language of each entry" if not lang or lang.lower().startswith("auto") \
         else f"the entries are {lang}"
+    if words:
+        what = ("Each entry is a word with the sentence it was taken from. Translate the WORD into English as it is "
+                "used in that sentence, as a short dictionary-style gloss of one to four words, never a translation of "
+                "the whole sentence.")
+        shape = "The input is a JSON object mapping an id to {\"word\": ..., \"sentence\": ...}. "
+    else:
+        what = ("Each entry is a separate word, phrase or line of on-screen text: translate it on its own, never "
+                "merge, split, reorder, summarise or explain entries.")
+        shape = "The input is a JSON object mapping an id to an entry. "
     return (
-        "You are a translation engine. Translate every entry below into English; " + src + ". "
-        "Each entry is a separate word, phrase or line of on-screen text: translate it on its own, never merge, "
-        "split, reorder, summarise or explain entries, and add no romanisation, notes or quotation marks. "
-        "If an entry is already English, a name, a number or a code, repeat it unchanged. "
-        "The input is a JSON object mapping an id to an entry. Reply with ONLY a JSON object with exactly the same "
-        "ids mapping to the English translation. No markdown, no code fences, no other text.\n\n"
+        "You are a translation engine. Translate every entry below into English; " + src + ". " + what +
+        " Add no romanisation, notes or quotation marks. "
+        "If it is already English, a name, a number or a code, repeat it unchanged. " + shape +
+        "Reply with ONLY a JSON object with exactly the same ids mapping to the English translation. "
+        "No markdown, no code fences, no other text.\n\n"
         + json.dumps(items, ensure_ascii=False)
     )
 
@@ -389,10 +450,10 @@ class Translator:
             break
         raise CleanerError(" | ".join(dict.fromkeys(errors))[:400] or "No provider answered.")
 
-    def _batches(self, idxs: list, texts: list):
+    def _batches(self, idxs: list, texts: list, contexts: list | None = None):
         batch, chars = [], 0
         for i in idxs:
-            n = len(texts[i])
+            n = len(texts[i]) + (len(contexts[i]) if contexts else 0)
             if batch and (len(batch) >= self.MAX_ITEMS or chars + n > self.MAX_CHARS):
                 yield batch
                 batch, chars = [], 0
@@ -401,11 +462,13 @@ class Translator:
         if batch:
             yield batch
 
-    def translate(self, texts: list, language: str = "Auto-detect", progress=None, cancel=None):
-        """-> (list of translation or None per text, TranslationOutcome)."""
+    def translate(self, texts: list, language: str = "Auto-detect", progress=None, cancel=None, contexts=None):
+        """-> (list of translation or None per text, TranslationOutcome).
+
+        With `contexts` (one sentence per text) each text is a word, translated as used in its sentence."""
         out = [None] * len(texts)
         outcome = TranslationOutcome()
-        stack = list(reversed(list(self._batches(list(range(len(texts))), texts))))
+        stack = list(reversed(list(self._batches(list(range(len(texts))), texts, contexts))))
         total = len(texts)
         failed_in_a_row = 0
         while stack:
@@ -413,7 +476,11 @@ class Translator:
                 raise CleanerCancelled()
             batch = stack.pop()
             ids = [str(n) for n in range(1, len(batch) + 1)]
-            prompt = build_translation_prompt({k: texts[i] for k, i in zip(ids, batch)}, language)
+            if contexts:
+                items = {k: {"word": texts[i], "sentence": contexts[i]} for k, i in zip(ids, batch)}
+            else:
+                items = {k: texts[i] for k, i in zip(ids, batch)}
+            prompt = build_translation_prompt(items, language, words=bool(contexts))
             try:
                 reply, pname = self._ask(prompt, cancel)
             except CleanerError as exc:
@@ -459,7 +526,7 @@ class Translator:
 class CleanResult:
     path: Path
     markdown: str
-    entries: int
+    entries: int                 # rows in the table
     lines_read: int
     duplicates: int
     noise: int
@@ -468,12 +535,26 @@ class CleanResult:
     failed_count: int = 0
     provider_name: str = ""
     notes: list = field(default_factory=list)
+    mode: str = "lines"          # "lines", "sentence" or "vocab"
+    furigana: list = field(default_factory=list)
+    sentences: int = 0           # in vocab mode: how many sentences the words came from
 
     def summary(self) -> str:
-        s = f"{self.entries} {_plural(self.entries, 'entry', 'entries')} from {self.lines_read} {_plural(self.lines_read, 'line')}"
-        if self.duplicates or self.noise:
-            s += (f" ({self.duplicates} {_plural(self.duplicates, 'duplicate')} and "
-                  f"{self.noise} noise {_plural(self.noise, 'line')} removed)")
+        if self.mode == "vocab":
+            s = (f"{self.entries} {_plural(self.entries, 'word')} from {self.sentences} "
+                 f"{_plural(self.sentences, 'sentence')}")
+        else:
+            unit = ("sentence", "sentences") if self.mode == "sentence" else ("entry", "entries")
+            s = f"{self.entries} {_plural(self.entries, *unit)} from {self.lines_read} {_plural(self.lines_read, 'line')}"
+            removed = []
+            if self.duplicates:
+                removed.append(f"{self.duplicates} {_plural(self.duplicates, 'duplicate')}")
+            if self.noise:
+                removed.append(f"{self.noise} noise {_plural(self.noise, 'line')}")
+            if self.furigana:
+                removed.append(f"{len(self.furigana)} furigana {_plural(len(self.furigana), 'line')}")
+            if removed:
+                s += " (" + ", ".join(removed) + " removed)"
         if self.translated:
             s += f", {self.translated_count} translated"
             if self.failed_count:
@@ -481,14 +562,25 @@ class CleanResult:
         return s
 
 
+MODES = ("lines", "sentence", "vocab")
+
+
 def clean_file(src, *, translate: bool = False, language: str = "Auto-detect", cfg: dict | None = None,
                provider: str = "auto", out_dir=None, progress=None, cancel=None, translator: Translator | None = None,
-               clock=datetime.now) -> CleanResult:
+               clock=datetime.now, mode: str = "sentence", ignore_furigana: bool = True,
+               tokenizer=None) -> CleanResult:
     """Read `src`, write `<name>_table.md` next to it (or in out_dir) and return what happened.
+
+    mode: "sentence" (default) one row per sentence, wrapped lines glued back together;
+          "vocab" one row per word, each with the sentence it came from;
+          "lines" one row per OCR line, as the file has them.
+    `tokenizer` is the Japanese word splitter (anything with tokenize() and reading()); None uses SudachiPy.
 
     Nothing is written if the file has no readable text, if translation is requested but cannot work at all,
     or if `cancel()` turns true. An existing file is never overwritten.
     """
+    if mode not in MODES:
+        raise CleanerError(f"Unknown mode {mode!r}.")
     src_path = Path(os.path.expanduser(str(src)))
     if progress:
         progress(0, 1, "Reading the file")
@@ -498,6 +590,28 @@ def clean_file(src, *, translate: bool = False, language: str = "Auto-detect", c
             raise CleanerError("The file is empty. There is nothing to clean yet.")
         raise CleanerError("The file has no readable text (every line was empty or only symbols).")
 
+    if mode != "lines":
+        if progress:
+            progress(0, 1, "Finding sentences")
+        parsed = to_sentences(parsed, ignore_furigana=ignore_furigana,
+                              get_tokenizer=(lambda: tokenizer) if tokenizer is not None else optional_tokenizer)
+        if not parsed.entries:
+            raise CleanerError("Nothing was left after the furigana lines were removed. Untick "
+                               "\"Ignore furigana\" and try again.")
+
+    words = None
+    if mode == "vocab":
+        if progress:
+            progress(0, 1, "Splitting words")
+        try:
+            words = extract_words([e.text for e in parsed.entries], language, tokenizer)
+        except WordSplitError as exc:
+            raise CleanerError(str(exc)) from exc
+        if not words:
+            raise CleanerError("No words were found. The file only holds symbols, numbers or particles.")
+    rows = words if mode == "vocab" else parsed.entries
+    label = "words" if mode == "vocab" else "entries"
+
     notes = []
     translated = False
     pname = ""
@@ -505,34 +619,39 @@ def clean_file(src, *, translate: bool = False, language: str = "Auto-detect", c
     if translate and is_english(language):
         notes.append("The text is English, so no English column was added.")
     elif translate:
-        if len(parsed.entries) > MAX_TRANSLATE_ENTRIES:
-            raise CleanerError(f"There are {len(parsed.entries)} entries, more than the {MAX_TRANSLATE_ENTRIES} that "
+        if len(rows) > MAX_TRANSLATE_ENTRIES:
+            raise CleanerError(f"There are {len(rows)} {label}, more than the {MAX_TRANSLATE_ENTRIES} that "
                                "one translation run allows. Clean without translating, or split the file.")
         tr = translator or Translator(cfg if cfg is not None else {}, provider)
         why = tr.problem()
         if why:
             raise CleanerError(why)
-        result, outcome = tr.translate([e.text for e in parsed.entries], language, progress, cancel)
+        if mode == "vocab":
+            result, outcome = tr.translate([w.word for w in rows], language, progress, cancel,
+                                           contexts=[w.sentence for w in rows])
+        else:
+            result, outcome = tr.translate([e.text for e in rows], language, progress, cancel)
         if outcome.done == 0:
             detail = outcome.errors[0] if outcome.errors else "no answer"
             raise CleanerError(f"Translation failed, so nothing was saved: {detail}")
-        for e, t in zip(parsed.entries, result):
-            e.translation = t
+        for row, t in zip(rows, result):
+            row.translation = t
         translated, ok, fail = True, outcome.done, outcome.failed
         pname = ", ".join(outcome.providers)
         if fail:
-            notes.append(f"{fail} of {len(parsed.entries)} entries could not be translated and are marked "
+            notes.append(f"{fail} of {len(rows)} {label} could not be translated and are marked "
                          f"{NOT_TRANSLATED}. Run the cleaner again to retry.")
     if cancel and cancel():
         raise CleanerCancelled()
 
     markdown = build_markdown(parsed.entries, source_name=src_path.name, language=language, translated=translated,
                               with_times=parsed.has_times, parsed=parsed, provider_name=pname, notes=notes,
-                              clock=clock)
+                              clock=clock, mode=mode, words=words)
     folder = Path(os.path.expanduser(str(out_dir))) if out_dir else src_path.parent
     path = write_new_file(folder, src_path.stem + TABLE_SUFFIX, markdown)
     if progress:
         progress(1, 1, "Done")
-    return CleanResult(path=path, markdown=markdown, entries=len(parsed.entries), lines_read=parsed.lines_read,
+    return CleanResult(path=path, markdown=markdown, entries=len(rows), lines_read=parsed.lines_read,
                        duplicates=parsed.duplicates, noise=parsed.noise, translated=translated, translated_count=ok,
-                       failed_count=fail, provider_name=pname, notes=notes)
+                       failed_count=fail, provider_name=pname, notes=notes, mode=mode, furigana=parsed.furigana,
+                       sentences=len(parsed.entries))

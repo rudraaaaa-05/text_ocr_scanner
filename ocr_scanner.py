@@ -16,6 +16,7 @@ from pathlib import Path
 from ocr_core import *  # noqa: F401,F403  (Qt-free core: config, capture, OCR providers, constants)
 from ocr_core import _merge, _is_int  # noqa: F401
 from ocr_cleaner import CleanerCancelled, CleanerError, Translator, clean_file, is_english
+from ocr_nlp import tokenizer_problem
 from ocr_daemon import DaemonLink, InstanceLock, cli_trigger, request, send_command, start_daemon  # noqa: F401
 
 if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "--trigger":
@@ -1045,8 +1046,8 @@ class MainWindow(QMainWindow):
 
     def _build_cleaner_page(self):
         page, lay = self._page()
-        h, sub = page_header("Table Cleaner", "Turns a raw output file into a tidy Markdown table: one row per line of text, "
-                                              "repeats and noise removed, optionally with an English column.")
+        h, sub = page_header("Table Cleaner", "Turns a raw output file into a tidy Markdown table: one row per sentence "
+                                              "(or per word), repeats and noise removed, optionally with an English column.")
         lay.addWidget(h)
         lay.addWidget(sub)
 
@@ -1072,6 +1073,23 @@ class MainWindow(QMainWindow):
         self.clean_lang.setToolTip("The language the text in the file is written in. Auto-detect works for most files.")
         self.clean_lang.currentTextChanged.connect(self._clean_lang_changed)
         cl.addLayout(h_row(QLabel("Language of the file"), self.clean_lang, stretch_end=True))
+
+        self.clean_vocab = QCheckBox("Word by word (vocabulary list) instead of sentence by sentence")
+        self.clean_vocab.setToolTip("Off: one row per sentence. Lines that were wrapped by the page are joined and lines "
+                                    "with several sentences are split.\nOn: one row per word (dictionary form, reading "
+                                    "and the sentence it came from).")
+        self.clean_vocab.setChecked(bool(self.d["cleaner_vocab"]))
+        self.clean_vocab.toggled.connect(self._clean_vocab_toggled)
+        cl.addWidget(self.clean_vocab)
+        self.clean_vocab_note = muted("")
+        cl.addWidget(self.clean_vocab_note)
+
+        self.clean_furigana = QCheckBox("Ignore furigana (small hiragana reading lines above kanji)")
+        self.clean_furigana.setToolTip("Short all-hiragana lines that are the reading of kanji in the next line are left "
+                                       "out. What was left out is listed in the table file.")
+        self.clean_furigana.setChecked(bool(self.d["cleaner_furigana"]))
+        self.clean_furigana.toggled.connect(lambda v: self.set_cfg("cleaner_furigana", bool(v)))
+        cl.addWidget(self.clean_furigana)
 
         self.clean_translate = QCheckBox("Translate to English (adds an English column)")
         self.clean_translate.setChecked(bool(self.d["cleaner_translate"]))
@@ -1133,6 +1151,10 @@ class MainWindow(QMainWindow):
         self.set_cfg("cleaner_language", text.strip() or "Auto-detect")
         self._apply_clean_ui()
 
+    def _clean_vocab_toggled(self, on: bool):
+        self.set_cfg("cleaner_vocab", bool(on))
+        self._apply_clean_ui()
+
     def _clean_translate_toggled(self, on: bool):
         self.set_cfg("cleaner_translate", bool(on))
         self._apply_clean_ui()
@@ -1146,6 +1168,12 @@ class MainWindow(QMainWindow):
 
     def _apply_clean_ui(self):
         """Provider row only matters while Translate is ticked and the language isn't English."""
+        lang = self.clean_lang.currentText().strip().lower()
+        japanese_possible = not lang or lang.startswith("auto") or lang.startswith("japanese")
+        self.clean_furigana.setVisible(japanese_possible)
+        why = tokenizer_problem() if (self.clean_vocab.isChecked() and japanese_possible) else None
+        self.clean_vocab_note.setText(why or "")
+        self.clean_vocab_note.setVisible(bool(why))
         want = self.clean_translate.isChecked()
         english = is_english(self.clean_lang.currentText())
         self.clean_provider_row.setVisible(want and not english)
@@ -1187,6 +1215,8 @@ class MainWindow(QMainWindow):
             self._clean_status("Choose a file to clean first.", "err")
             return
         translate = self.clean_translate.isChecked()
+        mode = "vocab" if self.clean_vocab.isChecked() else "sentence"
+        ignore_furigana = self.clean_furigana.isChecked()
         language = self.clean_lang.currentText().strip() or "Auto-detect"
         provider = self.clean_provider.currentData() or "auto"
         cfg = copy.deepcopy(self.d)  # the worker gets its own copy; the user may keep editing settings meanwhile
@@ -1204,6 +1234,7 @@ class MainWindow(QMainWindow):
         def work():
             try:
                 res = clean_file(src, translate=translate, language=language, cfg=cfg, provider=provider,
+                                 mode=mode, ignore_furigana=ignore_furigana,
                                  progress=lambda d, t, m: bus.post("clean_progress", d, t, m), cancel=cancel.is_set)
             except CleanerCancelled:
                 bus.post("clean_done", None, "cancelled")
