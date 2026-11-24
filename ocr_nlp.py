@@ -60,6 +60,113 @@ def kata_to_hira(s: str) -> str:
 
 
 # --------------------------------------------------------------------------------------------------------------
+# romaji -> hiragana (typing Japanese without an input method: the dictionary search box has a switch for it)
+# --------------------------------------------------------------------------------------------------------------
+
+def _romaji_table() -> dict:
+    t = {}
+    rows = {"": "あいうえお", "k": "かきくけこ", "s": "さしすせそ", "t": "たちつてと", "n": "なにぬねの", "h": "はひふへほ",
+            "m": "まみむめも", "r": "らりるれろ", "g": "がぎぐげご", "z": "ざじずぜぞ", "d": "だぢづでど", "b": "ばびぶべぼ",
+            "p": "ぱぴぷぺぽ"}
+    for c, kana in rows.items():
+        for v, k in zip("aiueo", kana):
+            t[c + v] = k
+        if c:                                           # kya kyu kyo, sya, tya, ...
+            for v, small in zip("auo", "ゃゅょ"):
+                t[c + "y" + v] = kana[1] + small
+    t.update({"ya": "や", "yu": "ゆ", "yo": "よ", "wa": "わ", "wo": "を", "wi": "うぃ", "we": "うぇ", "vu": "ゔ",
+              "shi": "し", "sha": "しゃ", "shu": "しゅ", "sho": "しょ", "she": "しぇ",
+              "chi": "ち", "cha": "ちゃ", "chu": "ちゅ", "cho": "ちょ", "che": "ちぇ", "tsu": "つ",
+              "fu": "ふ", "fa": "ふぁ", "fi": "ふぃ", "fe": "ふぇ", "fo": "ふぉ",
+              "ji": "じ", "ja": "じゃ", "ju": "じゅ", "jo": "じょ", "je": "じぇ", "jya": "じゃ", "jyu": "じゅ", "jyo": "じょ",
+              "cya": "ちゃ", "cyu": "ちゅ", "cyo": "ちょ", "shya": "しゃ", "shyu": "しゅ", "shyo": "しょ", "chya": "ちゃ", "chyu": "ちゅ", "chyo": "ちょ", "thi": "てぃ", "dhi": "でぃ", "tsa": "つぁ"})
+    for pre in "xl":                                    # small kana: xa la xtu ltu xya ...
+        for v, k in zip("aiueo", "ぁぃぅぇぉ"):
+            t[pre + v] = k
+        for v, k in zip("auo", "ゃゅょ"):
+            t[pre + "y" + v] = k
+        t[pre + "tu"] = t[pre + "tsu"] = "っ"
+        t[pre + "wa"] = "ゎ"
+    return t
+
+
+_ROMAJI = _romaji_table()
+_ROMAJI_MAX = max(len(k) for k in _ROMAJI)
+_VOWELS = "aiueo"
+_DOUBLES = set("bcdfghjkpqrstvwxyz")
+
+
+def romaji_to_kana(text: str, final: bool = False) -> str:
+    """'taberu' -> 'たべる', 'gakkou' -> 'がっこう', 'konnichiha' -> 'こんにちは', 'kin'en' -> 'きんえん'.
+
+    Letters that cannot be a complete syllable yet are left as typed ('ky' stays 'ky' until the next letter
+    arrives), so this can be applied to the text of a box after every keystroke. A lone 'n' at the end becomes 'ん'
+    only with final=True (when the person presses Enter). Kana, kanji and everything else pass through; '-' after a
+    kana is the long-vowel mark ー. Upper case letters are read like lower case."""
+    s = text or ""
+    low = s.lower()
+    out: list = []
+    i, n = 0, len(s)
+    while i < n:
+        ch = low[i]
+        if not ("a" <= ch <= "z" or ch in "'-"):
+            out.append(s[i])
+            i += 1
+            continue
+        if ch == "-":
+            out.append("ー" if out and is_kana(out[-1]) else s[i])
+            i += 1
+            continue
+        if ch == "'":
+            out.append(s[i])
+            i += 1
+            continue
+        if ch in _DOUBLES and i + 1 < n and low[i + 1] == ch:      # kk, tt, ss ... -> small tsu + the letter
+            out.append("っ")
+            i += 1
+            continue
+        if ch == "t" and low[i + 1:i + 3] == "ch":                 # tchi -> っち
+            out.append("っ")
+            i += 1
+            continue
+        if ch == "n":
+            nxt = low[i + 1] if i + 1 < n else ""
+            nxt2 = low[i + 2] if i + 2 < n else ""
+            if nxt == "'":
+                out.append("ん")
+                i += 2
+                continue
+            if nxt == "n":
+                if nxt2 and (nxt2 in _VOWELS or nxt2 == "y"):      # konnichi: the first n is ん, the second starts に
+                    out.append("ん")
+                    i += 1
+                else:                                              # nn is ん
+                    out.append("ん")
+                    i += 2
+                continue
+        for length in range(min(_ROMAJI_MAX, n - i), 0, -1):
+            kana = _ROMAJI.get(low[i:i + length])
+            if kana:
+                out.append(kana)
+                i += length
+                break
+        else:
+            if ch == "n":
+                nxt = low[i + 1] if i + 1 < n else ""
+                if (not nxt and final) or (nxt and nxt not in _VOWELS and nxt != "y"):
+                    out.append("ん")
+                    i += 1
+                    continue
+                if nxt == "y" and i + 2 < n:                       # ny + something that is not a/u/o
+                    out.append("ん")
+                    i += 1
+                    continue
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------------------------------------------
 # sentence splitting
 # --------------------------------------------------------------------------------------------------------------
 

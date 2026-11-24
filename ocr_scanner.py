@@ -31,13 +31,13 @@ try:
     from PySide6.QtCore import QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
     from PySide6.QtGui import (
         QAction, QColor, QDesktopServices, QGuiApplication, QIcon, QImage,
-        QKeySequence, QPainter, QPen, QPixmap,
+        QCursor, QKeySequence, QPainter, QPen, QPixmap,
     )
     from PySide6.QtWidgets import (
         QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
         QGridLayout, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit, QMainWindow,
         QMenu, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSpinBox,
-        QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
+        QStackedWidget, QSystemTrayIcon, QToolTip, QVBoxLayout, QWidget,
     )
 except ImportError as _exc:  # pragma: no cover
     sys.stderr.write(
@@ -46,10 +46,12 @@ except ImportError as _exc:  # pragma: no cover
     )
     sys.exit(1)
 
+from ocr_dict_ui import DICT_QSS, SELECTION_QSS, DictionaryTab, attach_selection_popup  # noqa: E402
+
 
 # sidebar order; the stack of pages is built in the same order
-PAGE_NAMES = ("Capture", "OCR Mode", "Table Cleaner", "Settings")
-PAGE_CAPTURE, PAGE_OCR_MODE, PAGE_CLEANER, PAGE_SETTINGS = range(4)
+PAGE_NAMES = ("Capture", "OCR Mode", "Table Cleaner", "Dictionary", "Settings")
+PAGE_CAPTURE, PAGE_OCR_MODE, PAGE_CLEANER, PAGE_DICTIONARY, PAGE_SETTINGS = range(5)
 
 
 def match_screens(screens, monitors) -> dict:
@@ -368,6 +370,7 @@ QMenu { background: #17171a; border: 1px solid #2a2a2f; padding: 6px; }
 QMenu::item { padding: 7px 20px; border-radius: 6px; }
 QMenu::item:selected { background: #2a2a30; }
 """
+QSS += DICT_QSS + SELECTION_QSS
 
 
 def make_assets():
@@ -897,6 +900,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_capture_page())
         self.stack.addWidget(self._build_keys_page())
         self.stack.addWidget(self._build_cleaner_page())
+        self.stack.addWidget(self._build_dictionary_page())
         self.stack.addWidget(self._build_settings_page())
         outer.addWidget(self.stack, 1)
         self.show_page(0)
@@ -994,6 +998,7 @@ class MainWindow(QMainWindow):
         self.last_text.setReadOnly(True)
         self.last_text.setPlaceholderText("The last text that was read appears here.")
         self.last_text.setFixedHeight(96)
+        self._sel_last = attach_selection_popup(self.last_text, self.lookup_word, self.make_flashcard)
         c3.addWidget(self.last_text)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -1128,6 +1133,7 @@ class MainWindow(QMainWindow):
         self.clean_preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.clean_preview.setPlaceholderText("A preview of the table appears here.")
         self.clean_preview.setMinimumHeight(220)
+        self._sel_clean = attach_selection_popup(self.clean_preview, self.lookup_word, self.make_flashcard)
         cl.addWidget(self.clean_preview, 1)
         self.btn_clean_open = QPushButton("Open table")
         self.btn_clean_open.clicked.connect(self.open_clean_file)
@@ -1295,6 +1301,21 @@ class MainWindow(QMainWindow):
             self._clean_status("The folder no longer exists.", "warn")
             return
         self.open_url(QUrl.fromLocalFile(str(p.parent)).toString())
+
+    # -- dictionary page
+    def _build_dictionary_page(self):
+        self.dict_tab = DictionaryTab()
+        return self.dict_tab
+
+    def lookup_word(self, text: str):
+        """Selection popup -> Lookup: open the Dictionary tab on the selected text."""
+        self.show_page(PAGE_DICTIONARY)
+        self.dict_tab.lookup(text)
+
+    def make_flashcard(self, text: str):
+        """Selection popup -> Make flashcard. Flashcards are not built yet; the popup button and this hook are ready."""
+        QToolTip.showText(QCursor.pos(), "Flashcards are not available yet.", self)
+        self.add_log("info", f"Flashcards are not available yet (selected: {text})", to_file=False)
 
     # -- settings page
     def _bind_check(self, chk: QCheckBox, key: str):
@@ -1863,6 +1884,9 @@ class MainWindow(QMainWindow):
         if self.link is not None:
             self.link.stop()
         self._save_timer.stop()
+        dict_tab = getattr(self, "dict_tab", None)
+        if dict_tab is not None:
+            dict_tab.shutdown()
         err = self.cfg.save()
         if err:
             log.error("%s", err)
@@ -1875,6 +1899,21 @@ class MainWindow(QMainWindow):
         self.shutdown()
         event.accept()
         QApplication.quit()
+
+
+def _prepare_input_method():
+    """Before QApplication exists: warn when the desktop's input method has no plugin in this Qt (no Japanese typing)."""
+    try:
+        from PySide6.QtCore import QLibraryInfo
+        folder = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)) / "platforminputcontexts"
+        found = {f.name.removeprefix("lib").split("platforminputcontextplugin")[0] for f in folder.glob("*platforminputcontextplugin*")}
+        message, unset = input_method_check(found)
+    except Exception:  # noqa: BLE001  this is only a courtesy check and must never stop the app from starting
+        return
+    if message:
+        sys.stderr.write(f"{APP_NAME}: {message}\n")
+    if unset:
+        os.environ.pop("QT_IM_MODULE", None)
 
 
 def main() -> int:
@@ -1892,6 +1931,8 @@ def main() -> int:
         print(f"{APP_NAME} is already running; brought its window forward.")
         return 0
 
+    if IS_LINUX:
+        _prepare_input_method()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)  # overlays and tray must not end the app

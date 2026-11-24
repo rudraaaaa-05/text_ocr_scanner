@@ -1,4 +1,7 @@
-     .venv/
-     __pycache__/
-     *.pyc
-     tests/
+.venv/
+__pycache__/
+*.pyc
+tests/
+# downloaded dictionary sources (large, CC licensed; see readme)
+data/dictionary/
+release_files/

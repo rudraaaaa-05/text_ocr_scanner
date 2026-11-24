@@ -1,0 +1,34 @@
+# Keeps the release named "data" up to date with the original JMdict, KANJIDIC2 and Tatoeba files, so that
+# `python ocr_dict.py download` can fetch them from this repository. Run it once by hand (Actions tab, Run workflow),
+# after that it refreshes itself on the 1st of every month.
+name: Update dictionary data
+
+on:
+  schedule:
+    - cron: "0 4 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write          # needed to create and edit the release
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download from the original sources
+        run: python ocr_dict.py download --upstream --dir release_files
+
+      - name: Publish the files as release "data"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view data >/dev/null 2>&1 || gh release create data \
+            --title "Dictionary data" \
+            --notes "Copies of the JMdict, KANJIDIC2 and Tatoeba source files used by ocr_dict.py. Licences and attribution: NOTICE.md."
+          gh release upload data release_files/* --clobber

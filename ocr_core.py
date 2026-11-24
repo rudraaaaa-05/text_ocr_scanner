@@ -48,6 +48,29 @@ def is_wayland() -> bool:
     )
 
 
+def input_method_check(available, env=None, wayland=None) -> tuple:
+    """Linux: can Japanese be typed into this app's text boxes?
+
+    Qt reads QT_IM_MODULE and loads the input-method plugin of that name. The PySide6 wheel ships only a few plugins
+    (ibus, compose ...), so QT_IM_MODULE=fcitx5 set by the desktop finds nothing and typing Japanese silently does not
+    work. `available` = plugin names found in Qt's platforminputcontexts folder (an empty set means: could not tell).
+    Returns (message, unset). message is "" when nothing is wrong; unset is True when QT_IM_MODULE should be removed
+    (on Wayland Qt then talks to the input method itself through the text-input protocol)."""
+    env = os.environ if env is None else env
+    wayland = is_wayland() if wayland is None else wayland
+    im = (env.get("QT_IM_MODULE") or "").strip().lower()
+    available = {a.lower() for a in (available or ())}
+    if not available or not im or im in ("none", "compose", "simple") or im in available:
+        return "", False
+    if im in ("fcitx", "fcitx5") and available & {"fcitx", "fcitx5"}:
+        return "", False
+    have = ", ".join(sorted(available))
+    msg = f"QT_IM_MODULE={im} but this Qt has no '{im}' input-method plugin (it has: {have}), so typing Japanese may not work. "
+    if wayland:
+        return msg + "Using Qt's own Wayland text input instead.", True
+    return msg + "Install the matching Qt 6 plugin for your input method, or use the \u3042 button in the Dictionary tab to type romaji.", False
+
+
 def is_hyprland() -> bool:
     return IS_LINUX and (
         bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"))
