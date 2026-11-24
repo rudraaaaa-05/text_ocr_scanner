@@ -149,7 +149,7 @@ Global hotkeys run inside the daemon through `pynput` and can be changed in Sett
 
 ### Wayland
 
-Wayland apps cannot grab global keys themselves. On desktops whose XDG portal offers `GlobalShortcuts` (for example KDE Plasma and recent GNOME) the daemon registers the keys through the portal; the desktop may show a confirmation dialog the first time. Hyprland keeps compositor binds by default. Where the portal is not available, you bind keys in your desktop to call `--trigger`, and Settings shows ready-made instructions for your desktop. `wayland_hotkeys` in `config.json` can be `auto` (default), `portal` or `manual`. What has and has not been verified on real systems is listed in [COMPATIBILITY.md](COMPATIBILITY.md). Example (Hyprland Lua):
+Wayland apps cannot grab global keys themselves. On desktops whose XDG portal offers `GlobalShortcuts` (for example KDE Plasma and recent GNOME) the daemon registers the keys through the portal; the desktop may show a confirmation dialog the first time. Hyprland keeps compositor binds by default. Where the portal is not available, you bind keys in your desktop to call `--trigger`, and Settings shows ready-made instructions for your desktop. `wayland_hotkeys` in `config.json` can be `auto` (default), `portal` or `manual`. What has and has not been verified on real systems is listed in [COMPATIBILITY.md](docs/COMPATIBILITY.md). Example (Hyprland Lua):
 
 ```lua
 hl.bind("CTRL + ALT + O", hl.dsp.exec_cmd("/path/to/.venv/bin/python /path/to/ocr_scanner.py --trigger region"))
