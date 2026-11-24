@@ -10,7 +10,7 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 - **Scan current**: press a key and the *already configured* target is read once, with no selector: the stored region in region mode, the configured monitor (or all monitors) in full-screen mode
 - **Background daemon**: recording, hotkeys and OCR keep running when the window is closed; autostart via a systemd user service (Linux) or a startup entry (Windows)
 - **Local OCR (offline)**: reads text on your computer. No API key, no upload, no rate limits. It scores every line and drops anything it is unsure of instead of guessing
-- **Table Cleaner**: turns a raw output file into a tidy Markdown table, one row per sentence (wrapped lines rejoined) or per word, repeats and noise removed, with an optional English translation column. See [Table Cleaner guide](docs/table-cleaner.md).
+- **Table Cleaner**: turns a raw output file into a tidy Markdown table, one row per sentence (wrapped lines rejoined) or per word, repeats and noise removed, with an optional English translation column. See [Table Cleaner guide](docs/table_cleaner.md).
 - **Dictionary (Japanese, offline)**: search and browse vocabulary, grammar and kanji, with readings, meanings and example sentences. See the [Dictionary guide](docs/dictionary.md). Select text in Capture or the Table Cleaner preview and choose **Lookup** to jump straight to it.
 - **AI OCR**: optional cloud providers (Gemini, Groq, OpenRouter, Mistral, DeepSeek, Ollama or any OpenAI-compatible endpoint). Local OCR can serve as the automatic fallback when one fails
 
