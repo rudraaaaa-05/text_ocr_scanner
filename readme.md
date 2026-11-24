@@ -2,6 +2,10 @@
 
 Read text from your screen with **offline local OCR** or free (and paid) AI APIs.
 
+>Developed primarily on Arch Linux with Hyprland.
+>Though it was designed with Japanese language learning in mind, it works for other languages as well.
+
+
 ## Features
 
 - **Full-screen recording** with Start / Pause / Stop
@@ -205,20 +209,18 @@ Goal: install it without touching Python or a terminal.
 | macOS | Signed and notarized `.app` / `.dmg` |
 | Linux | AppImage first, then an AUR package and `.deb` |
 
-Notes:
-- Candidate tooling: PyInstaller, Briefcase or Nuitka. Pick one and test the bundle size and startup time.
-- Unsigned Windows builds trigger SmartScreen warnings, and macOS requires an Apple Developer account ($99/year) to notarize. Budget for both.
-- Flatpak is attractive but its sandbox conflicts with `grim`, `hyprctl` and global hotkeys. Evaluate it later, not first.
-
 ### 3. Full cross-platform compatibility
 
 See [COMPATIBILITY.md](docs/COMPATIBILITY.md) 
 ### 4. Quality and releases
-- [ ] GitHub Actions CI on Linux, Windows with headless tests, covering the OCR pipeline, config handling, hotkey parsing and IPC.
 - [ ] Tagged releases that build and attach the installers automatically.
 - [ ] In-app update check (notify only; no silent updates).
 
-### 5. Ideas (not committed)
-- Language-learning extras: word lookup, furigana, Anki export.
-- Per-profile settings (for example one for games, one for manga).
+### 5. Ideas 
+- [x] Table Cleaner 
+- [x] Dictionary support for Japanese
+- [ ] DIctionary support for other languages
+- [x] Word lookup in dictionary
+- [ ] Flashcard creator (ANKI)
+
 
