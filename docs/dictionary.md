@@ -49,30 +49,6 @@ Exit status `0` means the database is complete and current, `2` means usable but
 | Vocabulary and English meanings | [JMdict](https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project), EDRDG | `JMdict_e.gz` | [CC BY-SA 4.0](https://www.edrdg.org/edrdg/licence.html) |
 | Kanji | [KANJIDIC2](https://www.edrdg.org/wiki/index.php/KANJIDIC_Project), EDRDG | `kanjidic2.xml.gz` | CC BY-SA 4.0 |
 | Example sentences and translations | [Tatoeba](https://tatoeba.org/downloads) contributors | `jpn_sentences.tsv.bz2`, `eng_sentences.tsv.bz2`, `jpn-eng_links.tsv.bz2` | [CC BY 2.0 FR](https://tatoeba.org/terms_of_use); some sentences are CC0 |
-| JLPT grammar points | Bundled CSV | `data/grammar_jlpt.csv` | Verify the licence of your copy before redistributing it |
 
-Keep the data attribution and share-alike terms when redistributing the sources or a database built from them. See [NOTICE.md](../NOTICE.md). The grammar CSV is separate from the sources downloaded above; do not redistribute it unless its own terms allow that.
-
-## Hosting a release mirror
-
-To host source copies on GitHub, publish the five downloaded files as assets on a release with the tag `data`. The repository includes an automatic monthly workflow at `.github/workflows/update-data.yml`; run it manually once after pushing the workflow to the default branch. The workflow refreshes the release assets monthly.
-
-Alternatively, create the release with GitHub CLI:
-
-```bash
-python ocr_dict.py download --upstream --dir release_files
-gh release create data --title "Dictionary data" \
-  --notes "Source files; see NOTICE.md for attribution." release_files/*
-```
-
-Configure the app's `DATA_MIRROR` in `ocr_dict.py` to point to:
-
-```text
-https://github.com/<owner>/<repo>/releases/download/data/
-```
-
-You can override the configured mirror per invocation with `--mirror URL` or set `OCR_SCANNER_DATA_URL`. Downloads fall back to upstream if the mirror is unavailable.
-
-## Grammar data
 
 The bundled JLPT grammar CSV contains grammar expressions, romaji, and meanings. If it is absent, the app uses its built-in grammar sample. If you replace it or redistribute it, make sure your copy's licence permits that use.
