@@ -22,7 +22,17 @@ jobs:
           python-version: "3.12"
 
       - name: Download from the original sources
-        run: python ocr_dict.py download --upstream --dir release_files
+        run: |
+          for attempt in 1 2 3; do
+            if python ocr_dict.py download --upstream --dir release_files; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Download failed; retrying in 20 seconds (attempt $((attempt + 1))/3)."
+              sleep 20
+            fi
+          done
+          exit 1
 
       - name: Publish the files as release "data"
         env:
