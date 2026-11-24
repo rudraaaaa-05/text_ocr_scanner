@@ -10,8 +10,8 @@ Read text from your screen with **offline local OCR** or free (and paid) AI APIs
 - **Scan current**: press a key and the *already configured* target is read once, with no selector: the stored region in region mode, the configured monitor (or all monitors) in full-screen mode
 - **Background daemon**: recording, hotkeys and OCR keep running when the window is closed; autostart via a systemd user service (Linux) or a startup entry (Windows)
 - **Local OCR (offline)**: reads text on your computer. No API key, no upload, no rate limits. It scores every line and drops anything it is unsure of instead of guessing
-- **Table Cleaner**: turns a raw output file into a tidy Markdown table, one row per sentence (wrapped lines rejoined) or per word, repeats and noise removed, with an optional English translation column
-- **Dictionary (Japanese, offline)**: a full-page workspace with search, alphabetical browsing of vocabulary, grammar and kanji, recent entries, every reading and meaning of a word, and several example sentences. Built from JMdict, KANJIDIC2 and Tatoeba (see [Dictionary](#dictionary)). Select text in the Capture output or the Table Cleaner preview and choose **Lookup** to jump straight to it
+- **Table Cleaner**: turns a raw output file into a tidy Markdown table, one row per sentence (wrapped lines rejoined) or per word, repeats and noise removed, with an optional English translation column. See [Table Cleaner guide](docs/table-cleaner.md).
+- **Dictionary (Japanese, offline)**: search and browse vocabulary, grammar and kanji, with readings, meanings and example sentences. See the [Dictionary guide](docs/dictionary.md). Select text in Capture or the Table Cleaner preview and choose **Lookup** to jump straight to it.
 - **AI OCR**: optional cloud providers (Gemini, Groq, OpenRouter, Mistral, DeepSeek, Ollama or any OpenAI-compatible endpoint). Local OCR can serve as the automatic fallback when one fails
 
 ## Platform support
@@ -108,51 +108,12 @@ ocr_output.txt   ->   ocr_output_2026-01-31_14-05-09.txt
 
 ## Table Cleaner
 
-The raw output file is a running log: the same text again on every capture, noise lines, timestamps, sentences cut in two where the page wrapped. The **Table Cleaner** tab turns it into a readable Markdown table. Your original file is never changed; the table is saved next to it:
+Use the **Table Cleaner** tab to turn an OCR output log into a Markdown table. Choose line, sentence, or word mode, optionally translate, and save a separate cleaned file without changing the original. For examples, options, limitations, and language-specific setup, see the [Table Cleaner guide](docs/table_cleaner.md).
 
-```
-ocr_output_2026-01-31_14-05-09.txt   ->   ocr_output_2026-01-31_14-05-09_table.md
-```
+## Dictionary
 
-Running it again never overwrites a table; it writes `_table_2.md`, `_table_3.md`, ...
+The Dictionary tab lets you search and browse Japanese vocabulary, grammar, and kanji, with readings, meanings, and example sentences. Select text in Capture or in the Table Cleaner preview and choose **Lookup** to open a matching entry. For setup, download/build commands, search tips, data sources, and licensing notes, see the [Dictionary guide](docs/dictionary.md).
 
-**Sentence by sentence (the default).** One row per sentence. Lines that the page wrapped are glued back together, and a line that holds several sentences becomes several rows:
-
-| # | Sentence | English |
-|--:|----------|---------|
-| 1 | こないだカフェーにいった。 | I went to a cafe the other day. |
-| 2 | どこでしたか？。 | Where was it? |
-| 3 | 覚えていない。 | I don't remember. |
-
-**Word by word** (tick *Word by word (vocabulary list)*). One row per word, in dictionary form, with its reading and the sentence it came from. Particles, endings, numbers and people's names are left out, and each word appears once:
-
-| # | Word | Reading | English | Sentence |
-|--:|------|---------|---------|----------|
-| 1 | 行く | いく | to go | こないだカフェーにいった。 |
-
-**Options**
-
-- **Language of the file**: the language the text is written in. `Auto-detect` is the default.
-- **Word by word**: see above. Languages written with spaces (English, German, ...) work out of the box. **Japanese needs one extra package**, the SudachiPy word splitter: `pip install -r requirements-vocab.txt` (the tab shows the exact command for your Python when it is missing). Chinese and Thai are not supported yet; use sentence mode.
-- **Ignore furigana**: the small hiragana readings above kanji are read by OCR as short lines of their own (`じょう`, `とりあつかい`) and would break the sentences they sit in. Short all-hiragana lines in front of a line with kanji are left out. With SudachiPy installed the reading is checked against the kanji line, which is reliable. Without it, a simpler rule is used. Everything that was left out is listed in the table file, so a mistake is visible. Untick the option if a real word gets lost.
-- **Translate to English**: adds the *English* column. In word mode each word is translated as it is used in its sentence. The *Time* column appears only when the file has timestamps.
-- **Translate with**: `Automatic` uses the active provider, then the fallbacks, from the **OCR Mode** tab. Or pick one provider. Local OCR can only read text, it can't translate, so translation needs a cloud provider (a free Google AI Studio key works) or Ollama (stays on your machine). The *text of the file* is sent to that provider, not screenshots.
-
-**What gets cleaned**
-
-- Timestamps are moved into the Time column. Blank lines and lines with no letters or digits (`|`, `---`) are dropped.
-- Repeats are removed, keeping the first one in its original order. Two lines count as the same when they differ only by case, spacing, punctuation or full-width vs half-width letters.
-- Spaces between Japanese / Chinese characters (an OCR artefact) are removed.
-- Characters that would break or restyle a Markdown table (`|`, `<`, `*`, backticks and so on) are escaped, so the table shows exactly what was on screen in any Markdown viewer.
-
-**How wrapped lines are recognised, and where it can be wrong.** The output file has only text, so the cleaner infers wrapping: a line that does not end in sentence punctuation, reaches nearly the width of the longest unfinished line nearby, and is followed by a line that finishes a sentence (or is also full width) is joined to it. Headings, list items (`1.`, `(1)`, bullets) and short lines are never joined. When it is unsure it does not join, so the worst case is two half sentences rather than one wrong sentence. Unusual layouts (several columns captured together, very ragged lines) can still be joined wrongly or not at all. Reading line positions from the OCR engine would remove the guessing; the output file does not store them yet.
-
-**Good to know**
-
-- Rows the provider could not translate are marked `_(not translated)_`, and the file says how many. Run the cleaner again to retry. If nothing could be translated at all, no file is written.
-- One run translates at most 2000 rows, so a huge log cannot silently use up a free quota. Entries are sent in batches, and rate limits are retried.
-- If the language is English there is nothing to translate, so no English column is added.
-- **Cancel** stops a running translation and saves nothing.
 
 ## Capture modes
 
@@ -260,77 +221,4 @@ See [COMPATIBILITY.md](docs/COMPATIBILITY.md)
 ### 5. Ideas (not committed)
 - Language-learning extras: word lookup, furigana, Anki export.
 - Per-profile settings (for example one for games, one for manga).
-
-## Dictionary
-
-The Dictionary tab is an offline Japanese dictionary. It has a search bar, **Vocab / Grammar / Kanji** browsing in kana order (with a kana-row filter, a "common words only" switch for vocabulary and a JLPT level filter for grammar), **Recents**, and a detail panel with every reading, written form and meaning of an entry plus example sentences. A search started while browsing one kind only searches that kind. **Back / forward** (also Alt+Left / Alt+Right) walk through the pages you visited.
-
-**Typing Japanese.** The search box accepts whatever your input method sends. If your system cannot type Japanese into the app, press the **あ** button next to the search box: letters you type then become kana as you go (`taberu` becomes たべる; press Enter to finish a trailing `n`). Turn it off to search in English. Grammar can also be found by its romaji (`tai`, `sou da`). On Linux the app warns at startup when `QT_IM_MODULE` names an input-method plugin that this Qt does not have (for example `fcitx5`).
-
-The bottom bar of the tab shows which dictionary is open, how many words, kanji, grammar points and example sentences it holds, what it was built from and when. If the full dictionary is not installed, the tab says so and shows the exact command to run; it then uses a tiny built-in sample, clearly labelled as such.
-
-### Sources
-
-| Part | Source | File | Licence |
-|---|---|---|---|
-| Vocabulary and meanings | [JMdict](https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project) (English glosses), EDRDG | `JMdict_e.gz` | [CC BY-SA 4.0](https://www.edrdg.org/edrdg/licence.html) |
-| Kanji | [KANJIDIC2](https://www.edrdg.org/wiki/index.php/KANJIDIC_Project), EDRDG | `kanjidic2.xml.gz` | CC BY-SA 4.0 |
-| Example sentences and translations | [Tatoeba](https://tatoeba.org/downloads) | `jpn_sentences.tsv`, `eng_sentences.tsv`, `jpn-eng_links.tsv` | [CC BY 2.0 FR](https://tatoeba.org/terms_of_use) |
-| Grammar points | a JLPT list of 831 points (N5 to N1) with romaji and meanings, bundled with the app | `data/grammar_jlpt.csv` | check the licence of your copy of the list before you redistribute it |
-
-The JMdict, KANJIDIC2 and Tatoeba data is **not** shipped inside the app; you fetch it with one command (below). If you redistribute a database built from it, keep the attribution and the share-alike terms of these licences (check them; this is not legal advice). The database records every source's name, URL, licence, file size and SHA-256 in its metadata.
-
-### Download
-
-```bash
-python ocr_dict.py download
-```
-
-saves the five files into `data/dictionary/` (or the folder in `OCR_SCANNER_DICT_DIR`) under the names the importer expects, checks each one, and skips files that are already there. Options: `--force` (fetch again), `--only jmdict kanjidic tatoeba` (just some), `--dir FOLDER`, `--mirror URL` (your own copies, see below) and `--upstream` (ignore the mirror and use the original sources). Each file is written as `.part` and only renamed once complete, so an interrupted download never leaves a broken file. The sentence and link files must come from the same Tatoeba export; downloading them together guarantees that.
-
-The original sources are `http://ftp.edrdg.org/pub/Nihongo/JMdict_e.gz`, `http://www.edrdg.org/kanjidic/kanjidic2.xml.gz` and the three `.tsv.bz2` files under `https://downloads.tatoeba.org/exports/per_language/jpn/` (`jpn_sentences`, `jpn-eng_links`) and `.../eng/` (`eng_sentences`). The importer reads `.gz` and `.bz2` directly, so there is nothing to unpack.
-
-### Hosting your own copy of the data
-
-So that users get the files from your repository and not from several upstream servers:
-
-1. In your repository, publish a GitHub **release** with the tag `data` and attach the five files (git history stays small, and a release asset can be up to 2 GB). Either use the included workflow `.github/workflows/update-data.yml` (Actions tab, **Run workflow**; it then refreshes the files monthly on its own), or do it by hand:
-
-   ```bash
-   python ocr_dict.py download --upstream --dir release_files
-   gh release create data --title "Dictionary data" --notes "Source files, see NOTICE.md" release_files/*
-   # later, to update:  gh release upload data release_files/* --clobber
-   ```
-
-2. Put your address into `DATA_MIRROR` near the top of the download section in `ocr_dict.py` (`https://github.com/<you>/<repo>/releases/download/data/`). Users then run the same `python ocr_dict.py download`; if your copy is unavailable it falls back to the original sources by itself. Without editing the file, `--mirror URL` or `OCR_SCANNER_DATA_URL` does the same.
-3. Keep [NOTICE.md](NOTICE.md) in the repository: the licences require attribution, and JMdict and KANJIDIC2 are share-alike.
-
-### Import
-
-```bash
-python ocr_dict.py
-```
-
-finds the files in the folder above, prints which it found and which are missing, validates every file, and builds the database. The same import with every path spelled out:
-
-```bash
-python ocr_dict.py \
-    --jmdict data/dictionary/JMdict_e.gz \
-    --kanjidic data/dictionary/kanjidic2.xml.gz \
-    --tatoeba-jpn data/dictionary/jpn_sentences.tsv \
-    --tatoeba-eng data/dictionary/eng_sentences.tsv \
-    --tatoeba-links data/dictionary/jpn-eng_links.tsv
-```
-
-It prints the final database path and what was imported (words, kanji, grammar points, sentences, and anything skipped, such as links whose English sentence is missing). Importing JMdict takes under a minute. Options: `--out FILE` (database location, default: the app's config folder, or `$OCR_SCANNER_DICT_DB`), `--source-dir DIR`, `--grammar FILE` (a grammar CSV in the format of `data/grammar_jlpt.csv`: level, number, expression, romaji, meaning, with no header row, which replaces the bundled list; or a JSON file of extra points), `--sample` (only the small sample: a few words and kanji plus the full grammar list). `python ocr_dict.py build` means the same as `python ocr_dict.py`.
-
-How a build is made safe: every file is checked first (exists, not empty, really gzip/bzip2/XML/TSV, the right kind of file, the required tags and columns, the right language); the database is built in a temporary file next to the final one and replaces the old one only after it passed an integrity check. A bad or truncated download stops the import with a message naming the file and **leaves the existing dictionary untouched**. Your notes and recent entries live in a separate file (`dictionary_user.sqlite3`) that a rebuild never touches.
-
-### Check what is installed
-
-```bash
-python ocr_dict.py --check
-```
-
-reports the state, schema version, counts, the sources that were imported (with sizes and checksums) and the import time. Exit status 0 means a valid, complete, up-to-date dictionary; 2 means usable but incomplete, out of date or only the sample; 1 means missing or invalid. The app does the same check at startup and when you press **Reload**, so a dictionary you just built is picked up without restarting. States: `ready`, `partial` (a source was not imported), `stale` (the downloaded files changed since the import), `sample`, `missing`, `invalid`. Databases from older versions are upgraded automatically (a `.bak-v1` copy is kept); their old `level` column is still readable and no longer used (grammar levels are stored separately).
 
